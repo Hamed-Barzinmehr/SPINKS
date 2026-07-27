@@ -13,10 +13,12 @@ required to obtain:
 - optimized minima for two spin states;
 - Cartesian interpolation between the optimized minima;
 - minimum-energy crossing-point (MECP) optimization;
+- ROHF and UHF/UNO orbital preparation and active-space selection;
 - spin–orbit coupling calculations;
 - analytical energy gradients at the MECP;
 - numerical Hessians and effective-Hessian analysis;
 - reaction-coordinate construction and reduced-mass evaluation;
+- construction of total-energy and reaction-coordinate velocity grids;
 - Landau–Zener and Weak-Coupling spin-crossing probabilities;
 - microcanonical reaction rate constants;
 - canonical reaction rate constants;
