@@ -1,5 +1,5 @@
 **Spin Probability And Reaction Kinetics Suite (SPINKS)**
-**Current version:** 1.0.0
+**Current version:** 1.0.0 
 
 SPINKS is a fully automated Python–ORCA computational framework for
 end-to-end evaluation of spin-crossing probabilities and the corresponding
