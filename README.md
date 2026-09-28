@@ -1,5 +1,11 @@
 **Spin Inversion Kinetics Suite (SPINKS)**
 
+## Developer
+
+**Hamed Barzinmehr**  
+Department of Chemistry and Biochemistry  
+Baylor University
+
 **Current version:** 1.0.0 
 
 SPINKS is a fully automated Python–ORCA computational framework for
@@ -24,12 +30,6 @@ required to obtain:
 - canonical reaction rate constants;
 - graphical and text-based outputs; and
 - input files for independent validation with NAST.
-
-## Developer
-
-**Hamed Barzinmehr**  
-Department of Chemistry and Biochemistry  
-Baylor University
 
 ## Available Versions
 
