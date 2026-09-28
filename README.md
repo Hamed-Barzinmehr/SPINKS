@@ -1,4 +1,4 @@
-**Spin Probability And Reaction Kinetics Suite (SPINKS)**
+**Spin Inversion Kinetics Suite (SPINKS)**
 
 **Current version:** 1.0.0 
 
