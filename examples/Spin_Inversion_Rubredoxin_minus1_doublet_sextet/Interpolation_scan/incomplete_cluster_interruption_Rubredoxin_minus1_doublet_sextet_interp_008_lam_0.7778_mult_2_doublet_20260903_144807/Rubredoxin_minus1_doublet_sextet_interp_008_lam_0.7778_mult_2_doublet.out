@@ -1,0 +1,784 @@
+
+                                 *****************
+                                 * O   R   C   A *
+                                 *****************
+
+                                            #,                                       
+                                            ###                                      
+                                            ####                                     
+                                            #####                                    
+                                            ######                                   
+                                           ########,                                 
+                                     ,,################,,,,,                         
+                               ,,#################################,,                 
+                          ,,##########################################,,             
+                       ,#########################################, ''#####,          
+                    ,#############################################,,   '####,        
+                  ,##################################################,,,,####,       
+                ,###########''''           ''''###############################       
+              ,#####''   ,,,,##########,,,,          '''####'''          '####       
+            ,##' ,,,,###########################,,,                        '##       
+           ' ,,###''''                  '''############,,,                           
+         ,,##''                                '''############,,,,        ,,,,,,###''
+      ,#''                                            '''#######################'''  
+     '                                                          ''''####''''         
+             ,#######,   #######,   ,#######,      ##                                
+            ,#'     '#,  ##    ##  ,#'     '#,    #''#        ######   ,####,        
+            ##       ##  ##   ,#'  ##            #'  '#       #        #'  '#        
+            ##       ##  #######   ##           ,######,      #####,   #    #        
+            '#,     ,#'  ##    ##  '#,     ,#' ,#      #,         ##   #,  ,#        
+             '#######'   ##     ##  '#######'  #'      '#     #####' # '####'        
+
+
+
+                  #######################################################
+                  #                        -***-                        #
+                  #          Department of theory and spectroscopy      #
+                  #    Directorship and core code : Frank Neese         #
+                  #        Max Planck Institute fuer Kohlenforschung    #
+                  #                Kaiser Wilhelm Platz 1               #
+                  #                 D-45470 Muelheim/Ruhr               #
+                  #                      Germany                        #
+                  #                                                     #
+                  #                  All rights reserved                #
+                  #                        -***-                        #
+                  #######################################################
+
+
+                         Program Version 5.0.4 -  RELEASE  -
+
+
+ With contributions from (in alphabetic order):
+   Daniel Aravena         : Magnetic Suceptibility
+   Michael Atanasov       : Ab Initio Ligand Field Theory (pilot matlab implementation)
+   Alexander A. Auer      : GIAO ZORA, VPT2 properties, NMR spectrum
+   Ute Becker             : Parallelization
+   Giovanni Bistoni       : ED, misc. LED, open-shell LED, HFLD
+   Martin Brehm           : Molecular dynamics
+   Dmytro Bykov           : SCF Hessian
+   Vijay G. Chilkuri      : MRCI spin determinant printing, contributions to CSF-ICE
+   Dipayan Datta          : RHF DLPNO-CCSD density
+   Achintya Kumar Dutta   : EOM-CC, STEOM-CC
+   Dmitry Ganyushin       : Spin-Orbit,Spin-Spin,Magnetic field MRCI
+   Miquel Garcia          : C-PCM and meta-GGA Hessian, CC/C-PCM, Gaussian charge scheme
+   Yang Guo               : DLPNO-NEVPT2, F12-NEVPT2, CIM, IAO-localization
+   Andreas Hansen         : Spin unrestricted coupled pair/coupled cluster methods
+   Benjamin Helmich-Paris : MC-RPA, TRAH-SCF, COSX integrals
+   Lee Huntington         : MR-EOM, pCC
+   Robert Izsak           : Overlap fitted RIJCOSX, COSX-SCS-MP3, EOM
+   Marcus Kettner         : VPT2
+   Christian Kollmar      : KDIIS, OOCD, Brueckner-CCSD(T), CCSD density, CASPT2, CASPT2-K
+   Simone Kossmann        : Meta GGA functionals, TD-DFT gradient, OOMP2, MP2 Hessian
+   Martin Krupicka        : Initial AUTO-CI
+   Lucas Lang             : DCDCAS
+   Marvin Lechner         : AUTO-CI (C++ implementation), FIC-MRCC
+   Dagmar Lenk            : GEPOL surface, SMD
+   Dimitrios Liakos       : Extrapolation schemes; Compound Job, initial MDCI parallelization
+   Dimitrios Manganas     : Further ROCIS development; embedding schemes
+   Dimitrios Pantazis     : SARC Basis sets
+   Anastasios Papadopoulos: AUTO-CI, single reference methods and gradients
+   Taras Petrenko         : DFT Hessian,TD-DFT gradient, ASA, ECA, R-Raman, ABS, FL, XAS/XES, NRVS
+   Peter Pinski           : DLPNO-MP2, DLPNO-MP2 Gradient
+   Christoph Reimann      : Effective Core Potentials
+   Marius Retegan         : Local ZFS, SOC
+   Christoph Riplinger    : Optimizer, TS searches, QM/MM, DLPNO-CCSD(T), (RO)-DLPNO pert. Triples
+   Tobias Risthaus        : Range-separated hybrids, TD-DFT gradient, RPA, STAB
+   Michael Roemelt        : Original ROCIS implementation
+   Masaaki Saitow         : Open-shell DLPNO-CCSD energy and density
+   Barbara Sandhoefer     : DKH picture change effects
+   Avijit Sen             : IP-ROCIS
+   Kantharuban Sivalingam : CASSCF convergence, NEVPT2, FIC-MRCI
+   Bernardo de Souza      : ESD, SOC TD-DFT
+   Georgi Stoychev        : AutoAux, RI-MP2 NMR, DLPNO-MP2 response
+   Willem Van den Heuvel  : Paramagnetic NMR
+   Boris Wezisla          : Elementary symmetry handling
+   Frank Wennmohs         : Technical directorship
+
+
+ We gratefully acknowledge several colleagues who have allowed us to
+ interface, adapt or use parts of their codes:
+   Stefan Grimme, W. Hujo, H. Kruse, P. Pracht,  : VdW corrections, initial TS optimization,
+                  C. Bannwarth, S. Ehlert          DFT functionals, gCP, sTDA/sTD-DF
+   Ed Valeev, F. Pavosevic, A. Kumar             : LibInt (2-el integral package), F12 methods
+   Garnet Chan, S. Sharma, J. Yang, R. Olivares  : DMRG
+   Ulf Ekstrom                                   : XCFun DFT Library
+   Mihaly Kallay                                 : mrcc  (arbitrary order and MRCC methods)
+   Jiri Pittner, Ondrej Demel                    : Mk-CCSD
+   Frank Weinhold                                : gennbo (NPA and NBO analysis)
+   Christopher J. Cramer and Donald G. Truhlar   : smd solvation model
+   Lars Goerigk                                  : TD-DFT with DH, B97 family of functionals
+   V. Asgeirsson, H. Jonsson                     : NEB implementation
+   FAccTs GmbH                                   : IRC, NEB, NEB-TS, DLPNO-Multilevel, CI-OPT
+                                                   MM, QMMM, 2- and 3-layer-ONIOM, Crystal-QMMM,
+                                                   LR-CPCM, SF, NACMEs, symmetry and pop. for TD-DFT,
+                                                   nearIR, NL-DFT gradient (VV10), updates on ESD,
+                                                   ML-optimized integration grids
+   S Lehtola, MJT Oliveira, MAL Marques          : LibXC Library
+   Liviu Ungur et al                             : ANISO software
+
+
+ Your calculation uses the libint2 library for the computation of 2-el integrals
+ For citations please refer to: http://libint.valeyev.net
+
+ Your ORCA version has been built with support for libXC version: 5.1.0
+ For citations please refer to: https://tddft.org/programs/libxc/
+
+ This ORCA versions uses:
+   CBLAS   interface :  Fast vector & matrix operations
+   LAPACKE interface :  Fast linear algebra routines
+   SCALAPACK package :  Parallel linear algebra routines
+   Shared memory     :  Shared parallel matrices
+   BLAS/LAPACK       :  OpenBLAS 0.3.15  USE64BITINT DYNAMIC_ARCH NO_AFFINITY Zen SINGLE_THREADED
+        Core in use  :  Zen
+   Copyright (c) 2011-2014, The OpenBLAS Project
+
+
+================================================================================
+
+----- Orbital basis set information -----
+Your calculation utilizes the basis: def2-TZVP
+   F. Weigend and R. Ahlrichs, Phys. Chem. Chem. Phys. 7, 3297 (2005).
+
+----- AuxJ basis set information -----
+Your calculation utilizes the auxiliary basis: def2/J
+   F. Weigend, Phys. Chem. Chem. Phys. 8, 1057 (2006).
+
+================================================================================
+                                        WARNINGS
+                       Please study these warnings very carefully!
+================================================================================
+
+
+WARNING: your system is open-shell and RHF/RKS was chosen
+  ===> : WILL SWITCH to UHF/UKS
+
+
+INFO   : the flag for use of the SHARK integral package has been found!
+
+================================================================================
+                                       INPUT FILE
+================================================================================
+NAME = Rubredoxin_minus1_doublet_sextet_interp_008_lam_0.7778_mult_2_doublet.inp
+|  1> ! PBE def2-TZVP TightSCF SlowConv
+|  2> 
+|  3> %pal nprocs 12 end
+|  4> 
+|  5> %maxcore 8000
+|  6> 
+|  7> %scf
+|  8>   MaxIter 1500
+|  9>   SOSCFStart 0.01
+| 10>   LevelShift 0.5
+| 11> end
+| 12> 
+| 13> %output
+| 14>   PrintLevel 3
+| 15> end
+| 16> 
+| 17> * xyz -1 2
+| 18> Fe     0.580512576296     0.053349647022    -0.164521066485
+| 19> S      1.215917224419    -2.040007345400     0.341836683921
+| 20> S      1.504151125535     1.298292416167     1.452357729129
+| 21> S     -1.668550154630     0.155638072804    -0.322851831593
+| 22> S      1.269548854342     0.669553280846    -2.213368156947
+| 23> C     -2.066840929137     1.559700767903    -1.359527688181
+| 24> H     -1.390289406288     1.577051124124    -2.156020720581
+| 25> H     -3.076088321205     1.504610144859    -1.729513829535
+| 26> H     -1.994780208228     2.458751339909    -0.830864611541
+| 27> C      0.834600011851    -2.973973915857    -1.180327260162
+| 28> H      1.208460942667    -4.003691352393    -1.074532093798
+| 29> H     -0.247434093279    -3.000763434037    -1.348731376293
+| 30> H      1.308475256629    -2.494751004883    -2.045047769751
+| 31> C      0.363421713121     2.648045432182     1.759685612843
+| 32> H     -0.633114754926     2.267708342794     1.879657199166
+| 33> H      0.661192896742     3.176378523099     2.675978092443
+| 34> H      0.369658331193     3.336206047918     0.926014454160
+| 35> C      3.000235775654     1.161278030383    -2.020794468104
+| 36> H      3.615790993726     0.290041412763    -1.827334614100
+| 37> H      3.347297032257     1.653082043508    -2.942069519886
+| 38> H      3.100200173264     1.841115666284    -1.184174674705
+| 39> *
+| 40> 
+| 41>                          ****END OF INPUT****
+================================================================================
+
+                       ****************************
+                       * Single Point Calculation *
+                       ****************************
+
+---------------------------------
+CARTESIAN COORDINATES (ANGSTROEM)
+---------------------------------
+  Fe     0.580513    0.053350   -0.164521
+  S      1.215917   -2.040007    0.341837
+  S      1.504151    1.298292    1.452358
+  S     -1.668550    0.155638   -0.322852
+  S      1.269549    0.669553   -2.213368
+  C     -2.066841    1.559701   -1.359528
+  H     -1.390289    1.577051   -2.156021
+  H     -3.076088    1.504610   -1.729514
+  H     -1.994780    2.458751   -0.830865
+  C      0.834600   -2.973974   -1.180327
+  H      1.208461   -4.003691   -1.074532
+  H     -0.247434   -3.000763   -1.348731
+  H      1.308475   -2.494751   -2.045048
+  C      0.363422    2.648045    1.759686
+  H     -0.633115    2.267708    1.879657
+  H      0.661193    3.176379    2.675978
+  H      0.369658    3.336206    0.926014
+  C      3.000236    1.161278   -2.020794
+  H      3.615791    0.290041   -1.827335
+  H      3.347297    1.653082   -2.942070
+  H      3.100200    1.841116   -1.184175
+
+----------------------------
+CARTESIAN COORDINATES (A.U.)
+----------------------------
+  NO LB      ZA    FRAG     MASS         X           Y           Z
+   0 Fe   26.0000    0    55.850    1.097010    0.100816   -0.310900
+   1 S    16.0000    0    32.060    2.297751   -3.855055    0.645978
+   2 S    16.0000    0    32.060    2.842434    2.453417    2.744558
+   3 S    16.0000    0    32.060   -3.153103    0.294113   -0.610102
+   4 S    16.0000    0    32.060    2.399100    1.265272   -4.182660
+   5 C     6.0000    0    12.011   -3.905763    2.947407   -2.569135
+   6 H     1.0000    0     1.008   -2.627266    2.980195   -4.074289
+   7 H     1.0000    0     1.008   -5.812964    2.843301   -3.268307
+   8 H     1.0000    0     1.008   -3.769588    4.646367   -1.570107
+   9 C     6.0000    0    12.011    1.577165   -5.619996   -2.230495
+  10 H     1.0000    0     1.008    2.283660   -7.565880   -2.030571
+  11 H     1.0000    0     1.008   -0.467583   -5.670621   -2.548733
+  12 H     1.0000    0     1.008    2.472660   -4.714396   -3.864580
+  13 C     6.0000    0    12.011    0.686768    5.004081    3.325324
+  14 H     1.0000    0     1.008   -1.196413    4.285348    3.552037
+  15 H     1.0000    0     1.008    1.249473    6.002486    5.056866
+  16 H     1.0000    0     1.008    0.698553    6.304516    1.749914
+  17 C     6.0000    0    12.011    5.669624    2.194497   -3.818748
+  18 H     1.0000    0     1.008    6.832855    0.548099   -3.453162
+  19 H     1.0000    0     1.008    6.325475    3.123872   -5.559706
+  20 H     1.0000    0     1.008    5.858529    3.479204   -2.237766
+
+--------------------------------
+INTERNAL COORDINATES (ANGSTROEM)
+--------------------------------
+ Fe     0   0   0     0.000000000000     0.00000000     0.00000000
+ S      1   0   0     2.245502334885     0.00000000     0.00000000
+ S      1   2   0     2.239930290833   103.80865914     0.00000000
+ S      1   2   3     2.256948098843   109.87986938   235.47979918
+ S      1   2   3     2.247721582157   111.98565811   121.35523497
+ C      4   1   2     1.790174411743   107.33037873   203.47408451
+ H      6   4   1     1.045190962739   108.07755420    41.15620891
+ H      6   4   1     1.076338710601   111.56367432   162.50082352
+ H      6   4   1     1.045451733522   111.48841669   281.31679790
+ C      2   1   3     1.826110468728   103.28202662   193.95490596
+ H     10   2   1     1.100582851003   109.11467976   174.13960884
+ H     10   2   1     1.095388255040   110.29945171   293.98761957
+ H     10   2   1     1.096336584138   110.09859231    53.62954875
+ C      3   1   2     1.793752275175   106.24013926   213.65733759
+ H     14   3   1     1.073375244375   110.05615325    48.72024643
+ H     14   3   1     1.098815471735   109.41092759   168.70185422
+ H     14   3   1     1.081023371290   110.07280931   289.19375409
+ C      5   1   2     1.809462648010   105.70551785   279.19543039
+ H     18   5   1     1.084153211262   110.10033818    70.48881158
+ H     18   5   1     1.100486448893   109.51121123   190.61249406
+ H     18   5   1     1.082637876062   109.95008493   311.22100821
+
+---------------------------
+INTERNAL COORDINATES (A.U.)
+---------------------------
+ Fe     0   0   0     0.000000000000     0.00000000     0.00000000
+ S      1   0   0     4.243384446014     0.00000000     0.00000000
+ S      1   2   0     4.232854808750   103.80865914     0.00000000
+ S      1   2   3     4.265013805287   109.87986938   235.47979918
+ S      1   2   3     4.247578215582   111.98565811   121.35523497
+ C      4   1   2     3.382939370147   107.33037873   203.47408451
+ H      6   4   1     1.975124677227   108.07755420    41.15620891
+ H      6   4   1     2.033985390373   111.56367432   162.50082352
+ H      6   4   1     1.975617462590   111.48841669   281.31679790
+ C      2   1   3     3.450848676183   103.28202662   193.95490596
+ H     10   2   1     2.079800176087   109.11467976   174.13960884
+ H     10   2   1     2.069983812339   110.29945171   293.98761957
+ H     10   2   1     2.071775894620   110.09859231    53.62954875
+ C      3   1   2     3.389700552179   106.24013926   213.65733759
+ H     14   3   1     2.028385250799   110.05615325    48.72024643
+ H     14   3   1     2.076460313295   109.41092759   168.70185422
+ H     14   3   1     2.042838116106   110.07280931   289.19375409
+ C      5   1   2     3.419388854298   105.70551785   279.19543039
+ H     18   5   1     2.048752656496   110.10033818    70.48881158
+ H     18   5   1     2.079618002499   109.51121123   190.61249406
+ H     18   5   1     2.045889087967   109.95008493   311.22100821
+
+---------------------
+BASIS SET INFORMATION
+---------------------
+There are 4 groups of distinct atoms
+
+ Group   1 Type Fe  : 17s11p7d1f contracted to 6s4p4d1f pattern {842111/6311/4111/1}
+ Group   2 Type S   : 14s9p3d1f contracted to 5s5p2d1f pattern {73211/51111/21/1}
+ Group   3 Type C   : 11s6p2d1f contracted to 5s3p2d1f pattern {62111/411/11/1}
+ Group   4 Type H   : 5s1p contracted to 3s1p pattern {311/1}
+
+Atom   0Fe   basis set group =>   1
+Atom   1S    basis set group =>   2
+Atom   2S    basis set group =>   2
+Atom   3S    basis set group =>   2
+Atom   4S    basis set group =>   2
+Atom   5C    basis set group =>   3
+Atom   6H    basis set group =>   4
+Atom   7H    basis set group =>   4
+Atom   8H    basis set group =>   4
+Atom   9C    basis set group =>   3
+Atom  10H    basis set group =>   4
+Atom  11H    basis set group =>   4
+Atom  12H    basis set group =>   4
+Atom  13C    basis set group =>   3
+Atom  14H    basis set group =>   4
+Atom  15H    basis set group =>   4
+Atom  16H    basis set group =>   4
+Atom  17C    basis set group =>   3
+Atom  18H    basis set group =>   4
+Atom  19H    basis set group =>   4
+Atom  20H    basis set group =>   4
+---------------------------------
+AUXILIARY/J BASIS SET INFORMATION
+---------------------------------
+There are 4 groups of distinct atoms
+
+ Group   1 Type Fe  : 19s5p5d3f3g contracted to 8s5p5d2f3g pattern {121111111/11111/11111/21/111}
+ Group   2 Type S   : 14s5p5d2f1g contracted to 8s4p3d1f1g pattern {71111111/2111/311/2/1}
+ Group   3 Type C   : 12s5p4d2f1g contracted to 6s4p3d1f1g pattern {711111/2111/211/2/1}
+ Group   4 Type H   : 5s2p1d contracted to 3s1p1d pattern {311/2/1}
+
+Atom   0Fe   basis set group =>   1
+Atom   1S    basis set group =>   2
+Atom   2S    basis set group =>   2
+Atom   3S    basis set group =>   2
+Atom   4S    basis set group =>   2
+Atom   5C    basis set group =>   3
+Atom   6H    basis set group =>   4
+Atom   7H    basis set group =>   4
+Atom   8H    basis set group =>   4
+Atom   9C    basis set group =>   3
+Atom  10H    basis set group =>   4
+Atom  11H    basis set group =>   4
+Atom  12H    basis set group =>   4
+Atom  13C    basis set group =>   3
+Atom  14H    basis set group =>   4
+Atom  15H    basis set group =>   4
+Atom  16H    basis set group =>   4
+Atom  17C    basis set group =>   3
+Atom  18H    basis set group =>   4
+Atom  19H    basis set group =>   4
+Atom  20H    basis set group =>   4
+
+
+           ************************************************************
+           *        Program running with 12 parallel MPI-processes    *
+           *              working on a common directory               *
+           ************************************************************
+------------------------------------------------------------------------------
+                           ORCA GTO INTEGRAL CALCULATION
+                           -- RI-GTO INTEGRALS CHOSEN --
+------------------------------------------------------------------------------
+------------------------------------------------------------------------------
+                   ___                                                        
+                  /   \      - P O W E R E D   B Y -                         
+                 /     \                                                     
+                 |  |  |   _    _      __       _____    __    __             
+                 |  |  |  | |  | |    /  \     |  _  \  |  |  /  |          
+                  \  \/   | |  | |   /    \    | | | |  |  | /  /          
+                 / \  \   | |__| |  /  /\  \   | |_| |  |  |/  /          
+                |  |  |   |  __  | /  /__\  \  |    /   |      \           
+                |  |  |   | |  | | |   __   |  |    \   |  |\   \          
+                \     /   | |  | | |  |  |  |  | |\  \  |  | \   \       
+                 \___/    |_|  |_| |__|  |__|  |_| \__\ |__|  \__/        
+                                                                              
+                      - O R C A' S   B I G   F R I E N D -                    
+                                      &                                       
+                       - I N T E G R A L  F E E D E R -                       
+                                                                              
+ v1 FN, 2020, v2 2021                                                         
+------------------------------------------------------------------------------
+
+
+Reading SHARK input file Rubredoxin_minus1_doublet_sextet_interp_008_lam_0.7778_mult_2_doublet.SHARKINP.tmp ... ok
+----------------------
+SHARK INTEGRAL PACKAGE
+----------------------
+
+Number of atoms                             ...     21
+Number of basis functions                   ...    389
+Number of shells                            ...    159
+Maximum angular momentum                    ...      3
+Integral batch strategy                     ... SHARK/LIBINT Hybrid
+RI-J (if used) integral strategy            ... SPLIT-RIJ (Revised 2003 algorithm where possible)
+Printlevel                                  ...      1
+Contraction scheme used                     ... SEGMENTED contraction
+Coulomb Range Separation                    ... NOT USED
+Exchange Range Separation                   ... NOT USED
+Finite Nucleus Model                        ... NOT USED
+Auxiliary Coulomb fitting basis             ... AVAILABLE
+   # of basis functions in Aux-J            ...    621
+   # of shells in Aux-J                     ...    211
+   Maximum angular momentum in Aux-J        ...      4
+Auxiliary J/K fitting basis                 ... NOT available
+Auxiliary Correlation fitting basis         ... NOT available
+Auxiliary 'external' fitting basis          ... NOT available
+Integral threshold                          ...     2.500000e-11
+Primitive cut-off                           ...     2.500000e-12
+Primitive pair pre-selection threshold      ...     2.500000e-12
+
+Calculating pre-screening integrals         ... done (  0.1 sec) Dimension = 159
+Organizing shell pair data                  ... done (  0.1 sec)
+Shell pair information
+Total number of shell pairs                 ...     12720
+Shell pairs after pre-screening             ...     10132
+Total number of primitive shell pairs       ...     44283
+Primitive shell pairs kept                  ...     23446
+          la=0 lb=0:   2617 shell pairs
+          la=1 lb=0:   3028 shell pairs
+          la=1 lb=1:    912 shell pairs
+          la=2 lb=0:   1381 shell pairs
+          la=2 lb=1:    835 shell pairs
+          la=2 lb=2:    197 shell pairs
+          la=3 lb=0:    595 shell pairs
+          la=3 lb=1:    359 shell pairs
+          la=3 lb=2:    165 shell pairs
+          la=3 lb=3:     43 shell pairs
+
+Calculating one electron integrals          ... done (  0.0 sec)
+Calculating RI/J V-Matrix + Cholesky decomp.... done (  0.0 sec)
+Calculating Nuclear repulsion               ... done (  0.0 sec) ENN=   1213.514891453621 Eh
+
+SHARK setup successfully completed in   0.6 seconds
+
+Maximum memory used throughout the entire GTOINT-calculation: 27.0 MB
+
+
+           ************************************************************
+           *        Program running with 12 parallel MPI-processes    *
+           *              working on a common directory               *
+           ************************************************************
+-------------------------------------------------------------------------------
+                                 ORCA SCF
+-------------------------------------------------------------------------------
+
+------------
+SCF SETTINGS
+------------
+Hamiltonian:
+ Density Functional     Method          .... DFT(GTOs)
+ Exchange Functional    Exchange        .... PBE
+   PBE kappa parameter   XKappa         ....  0.804000
+   PBE mue parameter    XMuePBE         ....  0.219520
+ Correlation Functional Correlation     .... PBE
+   PBE beta parameter  CBetaPBE         ....  0.066725
+ LDA part of GGA corr.  LDAOpt          .... PW91-LDA
+ Gradients option       PostSCFGGA      .... off
+   Density functional embedding theory  .... OFF
+   NL short-range parameter             ....  6.400000
+ RI-approximation to the Coulomb term is turned on
+   Number of AuxJ basis functions       .... 621
+
+
+General Settings:
+ Integral files         IntName         .... Rubredoxin_minus1_doublet_sextet_interp_008_lam_0.7778_mult_2_doublet
+ Hartree-Fock type      HFTyp           .... UHF
+ Total Charge           Charge          ....   -1
+ Multiplicity           Mult            ....    2
+ Number of Electrons    NEL             ....  127
+ Basis Dimension        Dim             ....  389
+ Nuclear Repulsion      ENuc            ....   1213.5148914536 Eh
+
+Convergence Acceleration:
+ DIIS                   CNVDIIS         .... on
+   Start iteration      DIISMaxIt       ....     0
+   Startup error        DIISStart       ....  0.200000
+   # of expansion vecs  DIISMaxEq       ....     5
+   Bias factor          DIISBfac        ....   1.050
+   Max. coefficient     DIISMaxC        ....  10.000
+ Trust-Rad. Augm. Hess. CNVTRAH         .... auto
+   Auto Start mean grad. ratio tolernc. ....  1.125000
+   Auto Start start iteration           ....    20
+   Auto Start num. interpolation iter.  ....    10
+   Max. Number of Micro iterations      ....    16
+   Max. Number of Macro iterations      .... Maxiter - #DIIS iter
+   Number of Davidson start vectors     ....     2
+   Converg. threshold I  (grad. norm)   ....   1.000e-05
+   Converg. threshold II (energy diff.) ....   1.000e-08
+   Grad. Scal. Fac. for Micro threshold ....   0.100
+   Minimum threshold for Micro iter.    ....   0.010
+   NR start threshold (gradient norm)   ....   0.001
+   Initial trust radius                 ....   0.400
+   Minimum AH scaling param. (alpha)    ....   1.000
+   Maximum AH scaling param. (alpha)    .... 1000.000
+   Orbital update algorithm             .... Taylor
+   White noise on init. David. guess    .... on
+   Maximum white noise                  ....   0.010
+   Quad. conv. algorithm                .... NR
+ SOSCF                  CNVSOSCF        .... off
+ Level Shifting         CNVShift        .... on
+   Level shift para.    LevelShift      ....    0.5000
+   Turn off err/grad.   ShiftErr        ....    0.0000
+ Zerner damping         CNVZerner       .... off
+ Static damping         CNVDamp         .... on
+   Fraction old density DampFac         ....    0.8500
+   Max. Damping (<1)    DampMax         ....    0.9800
+   Min. Damping (>=0)   DampMin         ....    0.0000
+   Turn off err/grad.   DampErr         ....    0.0300
+ Fernandez-Rico         CNVRico         .... off
+
+SCF Procedure:
+ Maximum # iterations   MaxIter         ....  1500
+ SCF integral mode      SCFMode         .... Direct
+   Integral package                     .... SHARK and LIBINT hybrid scheme
+ Reset frequency        DirectResetFreq ....    20
+ Integral Threshold     Thresh          ....  2.500e-11 Eh
+ Primitive CutOff       TCut            ....  2.500e-12 Eh
+
+Convergence Tolerance:
+ Convergence Check Mode ConvCheckMode   .... Total+1el-Energy
+ Convergence forced     ConvForced      .... 0
+ Energy Change          TolE            ....  1.000e-08 Eh
+ 1-El. energy change                    ....  1.000e-05 Eh
+ DIIS Error             TolErr          ....  5.000e-07
+
+
+Diagonalization of the overlap matrix:
+Smallest eigenvalue                        ... 1.005e-03
+Time for diagonalization                   ...    0.033 sec
+Threshold for overlap eigenvalues          ... 1.000e-08
+Number of eigenvalues below threshold      ... 0
+Time for construction of square roots      ...    0.028 sec
+Total time needed                          ...    0.063 sec
+
+Time for model grid setup =    0.182 sec
+
+------------------------------
+INITIAL GUESS: MODEL POTENTIAL
+------------------------------
+Loading Hartree-Fock densities                     ... done
+Calculating cut-offs                               ... done
+Initializing the effective Hamiltonian             ... done
+Setting up the integral package (SHARK)            ... done
+Starting the Coulomb interaction                   ... done (   0.1 sec)
+Reading the grid                                   ... done
+Mapping shells                                     ... done
+Starting the XC term evaluation                    ... done (   0.1 sec)
+  promolecular density results
+     # of electrons  =    125.994364060
+     EX              =   -177.743722228
+     EC              =     -4.798930651
+     EX+EC           =   -182.542652879
+Transforming the Hamiltonian                       ... done (   0.0 sec)
+Diagonalizing the Hamiltonian                      ... done (   0.0 sec)
+Back transforming the eigenvectors                 ... done (   0.0 sec)
+Now organizing SCF variables                       ... done
+                      ------------------
+                      INITIAL GUESS DONE (   0.5 sec)
+                      ------------------
+-------------------
+DFT GRID GENERATION
+-------------------
+
+General Integration Accuracy     IntAcc      ... 4.388
+Radial Grid Type                 RadialGrid  ... OptM3 with GC (2021)
+Angular Grid (max. ang.)         AngularGrid ... 4 (Lebedev-302)
+Angular grid pruning method      GridPruning ... 4 (adaptive)
+Weight generation scheme         WeightScheme... Becke
+Basis function cutoff            BFCut       ... 1.0000e-11
+Integration weight cutoff        WCut        ... 1.0000e-14
+Angular grids for H and He will be reduced by one unit
+Partially contracted basis set               ... off
+Rotationally invariant grid construction     ... off
+
+Total number of grid points                  ...   103088
+Total number of batches                      ...     1623
+Average number of points per batch           ...       63
+Average number of grid points per atom       ...     4909
+Time for grid setup =    0.644 sec
+
+--------------
+SCF ITERATIONS
+--------------
+ITER       Energy         Delta-E        Max-DP      RMS-DP      [F,P]     Damp
+               ***  Starting incremental Fock matrix formation  ***
+  0  -3014.9121699624   0.000000000000 0.01722712  0.00025200  0.0898455 0.8500
+  1  -3015.0265348516  -0.114364889296 0.01803767  0.00033511  0.0711876 0.8500
+                               ***Turning on DIIS***
+  2  -3015.0904245019  -0.063889650221 0.01545379  0.00029556  0.0500620 0.8500
+  3  -3015.1184597798  -0.028035277980 0.00983290  0.00020712  0.0580328 0.8500
+  4  -3015.1454538158  -0.026994035914 0.00566829  0.00014238  0.0404608 0.8500
+  5  -3015.1671501054  -0.021696289602 0.02445672  0.00067543  0.0233413 0.0000
+  6  -3015.2516284342  -0.084478328843 0.00091688  0.00001825  0.0404687 0.8500
+  7  -3015.2539618821  -0.002333447924 0.00157461  0.00002590  0.0361214 0.8500
+  8  -3015.2570674633  -0.003105581180 0.01129074  0.00018920  0.0292767 0.0000
+  9  -3015.2640864532  -0.007018989908 0.00368489  0.00005554  0.0190816 0.0000
+ 10  -3015.2658785669  -0.001792113699 0.00353816  0.00004301  0.0086994 0.0000
+ 11  -3015.2663882720  -0.000509705108 0.00183374  0.00002511  0.0045704 0.0000
+ 12  -3015.2665479721  -0.000159700104 0.00149836  0.00001899  0.0017234 0.0000
+ 13  -3015.2666295787  -0.000081606539 0.00120142  0.00001525  0.0013203 0.0000
+ 14  -3015.2666906417  -0.000061063057 0.00107905  0.00001356  0.0009655 0.0000
+ 15  -3015.2667424367  -0.000051794987 0.00111573  0.00001219  0.0008912 0.0000
+ 16  -3015.2667875250  -0.000045088332 0.00119497  0.00001136  0.0007695 0.0000
+ 17  -3015.2668269293  -0.000039404210 0.00072126  0.00000847  0.0003695 0.0000
+ 18  -3015.2668529221  -0.000025992884 0.00086782  0.00000836  0.0004682 0.0000
+ 19  -3015.2668767263  -0.000023804147 0.00089582  0.00000813  0.0004171 0.0000
+               *** Restarting incremental Fock matrix formation ***
+                                   *** Resetting DIIS ***
+ 20  -3015.2668984987  -0.000021772453 0.00060760  0.00000571  0.0003049 0.0000
+ 21  -3015.2669103293  -0.000011830575 0.00041482  0.00000469  0.0005463 0.0000
+ 22  -3015.2669222240  -0.000011894652 0.00044867  0.00000454  0.0002955 0.0000
+ 23  -3015.2669325595  -0.000010335518 0.00049466  0.00000471  0.0002997 0.0000
+
+ WARNING: the maximum gradient error descreased on average only by a factor   1.1
+          during the last 20 iterations
+
+                      *** Initiating the TRAH-SCF procedure ***
+
+
+TRAH GRID
+---------
+
+General Integration Accuracy     IntAcc      ... 3.467
+Radial Grid Type                 RadialGrid  ... OptM3 with GC (2021)
+Angular Grid (max. ang.)         AngularGrid ... 1 (Lebedev-50)
+Angular grid pruning method      GridPruning ... 4 (adaptive)
+Weight generation scheme         WeightScheme... Becke
+Basis function cutoff            BFCut       ... 1.0000e-11
+Integration weight cutoff        WCut        ... 1.0000e-14
+Angular grids for H and He will be reduced by one unit
+Partially contracted basis set               ... off
+Rotationally invariant grid construction     ... off
+
+Total number of grid points                  ...    16683
+Total number of batches                      ...      273
+Average number of points per batch           ...       61
+Average number of grid points per atom       ...      794
+
+ --------------------------------------------------------------------------------------------
+   Iter.        energy            ||Error||_2        Shift      TRadius  Mac/Mic        Rej.
+ --------------------------------------------------------------------------------------------
+    0      -3015.266942928151     1.565766e-03                     0.400 (TRAH MAcro)   No
+WARNING : small    HOMO - LUMO gap : (op = alpha) 0.014123
+    0     dE    -1.195358e-05     1.381492e-02    -1.1953e-05      0.008 (TRAH MIcro)
+    0     dE    -1.459592e-04     2.445810e-02    -1.4426e-04      0.109 (TRAH MIcro)
+    0     dE    -7.967946e-04     3.581615e-02    -1.7393e-03      0.400 (TRAH MIcro)
+    0     dE    -1.536429e-03     2.596060e-02    -6.4703e-03      0.400 (TRAH MIcro)
+    0     dE    -2.336950e-03     1.936739e-02    -1.1821e-02      0.400 (TRAH MIcro)
+    0     dE    -2.476058e-03     7.688861e-03    -1.2810e-02      0.400 (TRAH MIcro)
+    0     dE    -2.521345e-03     4.579078e-03    -1.3179e-02      0.400 (TRAH MIcro)
+    0     dE    -2.543214e-03     4.646976e-03    -1.3343e-02      0.400 (TRAH MIcro)
+    0     dE    -2.571696e-03     5.967772e-03    -1.3621e-02      0.400 (TRAH MIcro)
+    0     dE    -2.622909e-03     7.184393e-03    -1.4127e-02      0.400 (TRAH MIcro)
+    0     dE    -8.789637e-04     2.437862e-03    -1.6143e-02      0.204 (TRAH MIcro)
+    0     dE    -8.815357e-04     1.217925e-03    -1.6189e-02      0.204 (TRAH MIcro)
+    0     dE    -8.728848e-04     4.451522e-04    -1.6202e-02      0.202 (TRAH MIcro)
+    0     dE    -8.697508e-04     2.401465e-04    -1.6204e-02      0.202 (TRAH MIcro)
+    1      -3015.267702720713     7.869922e-03                     0.480 (TRAH MAcro)   No
+WARNING : small    HOMO - LUMO gap : (op = alpha) 0.015672
+    1     dE    -1.155270e-05     8.331735e-03    -1.1553e-05      0.001 (TRAH MIcro)
+    1     dE    -7.558091e-04     5.180458e-02    -7.0776e-04      0.261 (TRAH MIcro)
+    1     dE    -2.089161e-03     3.197451e-02    -3.7074e-03      0.480 (TRAH MIcro)
+    1     dE    -2.671668e-03     1.867232e-02    -6.2529e-03      0.480 (TRAH MIcro)
+    1     dE    -2.941754e-03     8.661111e-03    -7.4953e-03      0.480 (TRAH MIcro)
+    1     dE    -3.014409e-03     6.204902e-03    -7.8383e-03      0.480 (TRAH MIcro)
+    1     dE    -2.673384e-03     7.135010e-03    -9.0467e-03      0.425 (TRAH MIcro)
+    1     dE    -2.977773e-03     6.855581e-03    -9.2115e-03      0.457 (TRAH MIcro)
+    1     dE    -3.225133e-03     4.798016e-03    -9.4357e-03      0.480 (TRAH MIcro)
+    1     dE    -3.244261e-03     2.995312e-03    -9.6199e-03      0.480 (TRAH MIcro)
+    1     dE    -3.255201e-03     1.924013e-03    -9.7258e-03      0.480 (TRAH MIcro)
+    1     dE    -3.258131e-03     1.294342e-03    -9.7530e-03      0.480 (TRAH MIcro)
+    1     dE    -3.259770e-03     7.864145e-04    -9.7677e-03      0.480 (TRAH MIcro)
+ ---------------------------------
+          TRAH Step control 
+ ---------------------------------
+  predicted energy change = -0.003260
+  actual energy  change   = 0.000030
+  energy change ratio     = -0.009206
+  old trust radius        = 0.480000
+  new trust radius        = 0.336000
+  reject step?            =  1
+    2      -3015.267702720713     1.565766e-03                     0.336 (TRAH MAcro)  Yes
+    3      -3015.267702720713     7.869922e-03                     0.336 (TRAH MAcro)   No
+WARNING : small    HOMO - LUMO gap : (op = alpha) 0.015672
+    3     dE    -1.155255e-05     8.334941e-03    -1.1553e-05      0.001 (TRAH MIcro)
+    3     dE    -7.557544e-04     5.180793e-02    -7.0771e-04      0.261 (TRAH MIcro)
+    3     dE    -1.543425e-03     2.255696e-02    -5.9830e-03      0.336 (TRAH MIcro)
+    3     dE    -1.827256e-03     1.288194e-02    -8.4976e-03      0.336 (TRAH MIcro)
+    3     dE    -1.953881e-03     5.682663e-03    -9.6963e-03      0.336 (TRAH MIcro)
+    3     dE    -1.981691e-03     3.547220e-03    -9.9629e-03      0.336 (TRAH MIcro)
+    3     dE    -2.008041e-03     4.462956e-03    -1.0331e-02      0.336 (TRAH MIcro)
+    3     dE    -2.026686e-03     3.671257e-03    -1.0695e-02      0.336 (TRAH MIcro)
+    3     dE    -2.037794e-03     2.371609e-03    -1.0958e-02      0.336 (TRAH MIcro)
+    3     dE    -2.042520e-03     1.505117e-03    -1.1076e-02      0.336 (TRAH MIcro)
+    3     dE    -1.319997e-03     1.295035e-03    -1.3872e-02      0.231 (TRAH MIcro)
+    3     dE    -1.315546e-03     3.748494e-04    -1.3881e-02      0.231 (TRAH MIcro)
+    4      -3015.268720045921     7.494100e-03                     0.403 (TRAH MAcro)   No
+WARNING : small    HOMO - LUMO gap : (op = alpha) 0.018413
+    4     dE    -9.915761e-06     7.309149e-03    -9.9157e-06      0.001 (TRAH MIcro)
+    4     dE    -5.344494e-05     8.801572e-03    -5.3420e-05      0.022 (TRAH MIcro)
+    4     dE    -1.143378e-04     5.198450e-03    -1.1391e-04      0.061 (TRAH MIcro)
+    4     dE    -1.363237e-04     4.340989e-03    -1.3549e-04      0.078 (TRAH MIcro)
+    4     dE    -1.602789e-04     3.443091e-03    -1.5864e-04      0.102 (TRAH MIcro)
+    4     dE    -1.739804e-04     2.430354e-03    -1.7167e-04      0.116 (TRAH MIcro)
+    4     dE    -1.833937e-04     3.147640e-03    -1.8044e-04      0.128 (TRAH MIcro)
+    4     dE    -2.010418e-04     3.421236e-03    -1.9617e-04      0.158 (TRAH MIcro)
+    4     dE    -2.131937e-04     2.225108e-03    -2.0630e-04      0.183 (TRAH MIcro)
+    4     dE    -2.206048e-04     1.780494e-03    -2.1218e-04      0.199 (TRAH MIcro)
+    4     dE    -2.266233e-04     2.133703e-03    -2.1673e-04      0.214 (TRAH MIcro)
+    4     dE    -2.364117e-04     1.753275e-03    -2.2379e-04      0.237 (TRAH MIcro)
+    4     dE    -2.416257e-04     1.398521e-03    -2.2737e-04      0.250 (TRAH MIcro)
+    4     dE    -2.459456e-04     1.207305e-03    -2.3017e-04      0.262 (TRAH MIcro)
+ ---------------------------------
+          TRAH Step control 
+ ---------------------------------
+  predicted energy change = -0.000246
+  actual energy  change   = 0.000076
+  energy change ratio     = -0.308839
+  old trust radius        = 0.403200
+  new trust radius        = 0.282240
+  reject step?            =  1
+    5      -3015.268720045921     7.869922e-03                     0.282 (TRAH MAcro)  Yes
+    6      -3015.268720045921     7.494100e-03                     0.282 (TRAH MAcro)   No
+WARNING : small    HOMO - LUMO gap : (op = alpha) 0.018413
+    6     dE    -9.915634e-06     7.306662e-03    -9.9156e-06      0.001 (TRAH MIcro)
+    6     dE    -5.344531e-05     8.799247e-03    -5.3420e-05      0.022 (TRAH MIcro)
+    6     dE    -1.143348e-04     5.182377e-03    -1.1391e-04      0.061 (TRAH MIcro)
+    6     dE    -1.363225e-04     4.348731e-03    -1.3549e-04      0.078 (TRAH MIcro)
+    6     dE    -1.602787e-04     3.436442e-03    -1.5864e-04      0.102 (TRAH MIcro)
+    6     dE    -1.739820e-04     2.430843e-03    -1.7167e-04      0.116 (TRAH MIcro)
+    6     dE    -1.833950e-04     3.146019e-03    -1.8044e-04      0.128 (TRAH MIcro)
+    6     dE    -2.010439e-04     3.421149e-03    -1.9617e-04      0.158 (TRAH MIcro)
+    6     dE    -2.131970e-04     2.223565e-03    -2.0630e-04      0.183 (TRAH MIcro)
+    6     dE    -2.206054e-04     1.780173e-03    -2.1218e-04      0.199 (TRAH MIcro)
+    6     dE    -2.266231e-04     2.134381e-03    -2.1673e-04      0.214 (TRAH MIcro)
+    6     dE    -2.364122e-04     1.752237e-03    -2.2379e-04      0.237 (TRAH MIcro)
+    6     dE    -2.416258e-04     1.399040e-03    -2.2737e-04      0.250 (TRAH MIcro)
+    6     dE    -2.459457e-04     1.207392e-03    -2.3017e-04      0.262 (TRAH MIcro)
+ ---------------------------------
+          TRAH Step control 
+ ---------------------------------
+  predicted energy change = -0.000246
+  actual energy  change   = 0.000076
+  energy change ratio     = -0.308847
+  old trust radius        = 0.282240
+  new trust radius        = 0.197568
+  reject step?            =  1
+    7      -3015.268720045921     7.869922e-03                     0.198 (TRAH MAcro)  Yes
+    8      -3015.268720045923     7.494100e-03                     0.198 (TRAH MAcro)   No
+WARNING : small    HOMO - LUMO gap : (op = alpha) 0.018413
+    8     dE    -9.915632e-06     7.306742e-03    -9.9156e-06      0.001 (TRAH MIcro)
+    8     dE    -5.344749e-05     8.808307e-03    -5.3422e-05      0.022 (TRAH MIcro)
+    8     dE    -1.143313e-04     5.180452e-03    -1.1390e-04      0.061 (TRAH MIcro)
+    8     dE    -1.363209e-04     4.351511e-03    -1.3549e-04      0.078 (TRAH MIcro)
+    8     dE    -1.602772e-04     3.437648e-03    -1.5864e-04      0.102 (TRAH MIcro)
+    8     dE    -1.739808e-04     2.427226e-03    -1.7167e-04      0.116 (TRAH MIcro)
+    8     dE    -1.833943e-04     3.146723e-03    -1.8044e-04      0.128 (TRAH MIcro)
+    8     dE    -2.010476e-04     3.421593e-03    -1.9617e-04      0.158 (TRAH MIcro)
+    8     dE    -2.132045e-04     2.223865e-03    -2.0631e-04      0.183 (TRAH MIcro)
+    8     dE    -2.204523e-04     1.751999e-03    -2.3963e-04      0.198 (TRAH MIcro)
+    8     dE    -2.244946e-04     1.844333e-03    -4.3881e-04      0.198 (TRAH MIcro)
+    8     dE    -2.291036e-04     1.240091e-03    -6.6758e-04      0.198 (TRAH MIcro)
+    8     dE    -2.308115e-04     8.849144e-04    -7.5219e-04      0.198 (TRAH MIcro)
+    8     dE    -2.318916e-04     6.909154e-04    -8.1033e-04      0.198 (TRAH MIcro)
+    9      -3015.268813085850     4.816380e-03                     0.198 (TRAH MAcro)   No
