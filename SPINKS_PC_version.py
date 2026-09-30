@@ -1,0 +1,13498 @@
+#%% STEP 1. Local PC AUTOMATED MINIMA + INTERPOLATION + MECP OPTIMIZATION
+
+import os
+import re
+import sys
+import time
+import shutil
+import subprocess
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+
+print(r'''
+====================================================================
+ SPINKS — Spin Inversion Kinetics Suite
+ Version 1.0.0
+====================================================================
+
+Developer:
+    Hamed Barzinmehr
+
+Affiliation:
+    Department of Chemistry and Biochemistry
+    Baylor University
+
+Repository:
+    https://github.com/Hamed-Barzinmehr/SPINKS
+
+====================================================================
+ STEP 1 | LOCAL PC VERSION
+ Automated spin-state minima, interpolation scan, and MECP search
+====================================================================
+
+This is the Local PC version of the SPINKS workflow.
+
+The ORCA input construction, minimum optimizations, interpolation scan,
+reference selection, and MECP optimization use the same computational
+settings and numerical logic as the cluster version. The two versions
+differ only in job execution and file handling.
+
+No SSH, no SFTP, no PBS/qsub, no bash submission file, and no remote
+cluster directory are used. ORCA calculations are executed directly on
+this machine by calling the local ORCA executable.
+
+You only need to provide the directory where ORCA is installed or
+extracted.
+
+Examples:
+  Windows : C:\ORCA
+  Linux   : /home/user/orca_5_0_4
+  macOS   : /Applications/orca_5_0_4
+
+The code will look for:
+  orca.exe  on Windows
+  orca      on Linux/macOS
+
+ORCA jobs are run as blocking local subprocesses. When a job finishes,
+the output is checked for normal termination. If a job fails, SPINKS
+prints the final portion of the output, allows the user to edit the ORCA
+input, archives the failed attempt, and reruns the corrected input in the
+same job directory.
+
+''')
+
+IS_SPYDER = ("spyder_kernels" in sys.modules) or ("spyder" in sys.modules)
+RUN_MODE = "LOCAL"
+workflow_mode = "MECP_ONLY"
+run_mecp_optimization = True
+
+# ============================================================
+# General utilities
+# ============================================================
+
+def safe_input(prompt=""):
+    return input(prompt)
+
+
+def section(title):
+    print("\n" + "=" * 72)
+    print(f" {title}")
+    print("=" * 72 + "\n")
+
+
+def subsection(title):
+    print("\n" + "-" * 72)
+    print(title)
+    print("-" * 72 + "\n")
+
+
+def ask_int(prompt, minimum=None):
+    while True:
+        value = safe_input(prompt).strip()
+        try:
+            value = int(value)
+            if minimum is not None and value < minimum:
+                print(f"  Input must be at least {minimum}.")
+                continue
+            return value
+        except ValueError:
+            print("  Please enter an integer.")
+
+
+def ask_yes_no(prompt, default=None):
+    if default is True:
+        suffix = " (Y/N, default Y): "
+    elif default is False:
+        suffix = " (Y/N, default N): "
+    else:
+        suffix = " (Y/N): "
+
+    while True:
+        ans = safe_input(prompt + suffix).strip().lower()
+        if ans == "" and default is not None:
+            return bool(default)
+        if ans in ("y", "yes"):
+            return True
+        if ans in ("n", "no"):
+            return False
+        print("  Please answer Y or N.")
+
+
+def parse_int_list(text):
+    return [int(x) for x in text.replace(" ", "").split(",") if x]
+
+
+def read_geometry_block(title):
+    print(f"\n{title}")
+    print("""
+Please provide Cartesian coordinates using the format:
+
+atom_label   x_coordinate   y_coordinate   z_coordinate
+
+Example:
+
+O    0.00000000000000    0.00000000818129     0.11690363084563
+H    0.00000000000000    0.76528672468584    -0.46747581229803
+H    0.00000000000000   -0.76528673286712    -0.46747581854760
+""")
+    print("Press ENTER on an empty line when the geometry is complete.\n")
+    lines = []
+    while True:
+        line = safe_input()
+        if line.strip() == "":
+            break
+        lines.append(line.rstrip())
+    if not lines:
+        raise ValueError("No geometry was provided.")
+    return "\n".join(lines)
+
+
+def multiplicity_name(mult):
+    return {
+        1: "singlet", 2: "doublet", 3: "triplet", 4: "quartet", 5: "quintet",
+        6: "sextet", 7: "septet", 8: "octet", 9: "nonet", 10: "decet"
+    }.get(int(mult), f"mult{mult}")
+
+
+def collect_multiline_until_eof():
+    lines = []
+    while True:
+        line = safe_input()
+        if line.strip() == "EOF":
+            break
+        lines.append(line)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def validate_placeholders(text, placeholders, label):
+    missing = [p for p in placeholders if p not in text]
+    if missing:
+        raise RuntimeError(f"The edited {label} template is missing: " + ", ".join(missing))
+
+
+def write_text(path, text):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8", newline="\n")
+
+
+def read_text(path):
+    return Path(path).read_text(encoding="utf-8", errors="ignore")
+
+
+def file_exists(path):
+    return Path(path).exists()
+
+
+def minimum_input_contains_required_keywords(inp_text):
+    for line in inp_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("!"):
+            tokens = stripped.lower().split()
+            has_opt = "opt" in tokens
+            has_freq = "freq" in tokens
+            return has_opt, has_freq
+    return False, False
+
+
+def enforce_minimum_input_requirements(inp_text, job_label):
+    while True:
+        has_opt, has_freq = minimum_input_contains_required_keywords(inp_text)
+        if has_opt and has_freq:
+            return inp_text
+
+        section("STEP 1 INPUT VALIDATION")
+        print(f"The ORCA input for {job_label} is missing one or more required keywords.\n")
+        if not has_opt:
+            print("Missing keyword: Opt")
+        if not has_freq:
+            print("Missing keyword: Freq")
+        print(
+            "\nFor Step 1, both geometry optimization (Opt) and frequency "
+            "analysis (Freq) are required."
+        )
+        print(
+            "The optimized geometry is used for interpolation and MECP "
+            "generation, while vibrational frequencies are required for "
+            "zero-point energy correction of the barrier."
+        )
+        print("\nPlease re-edit the input file and submit a corrected version.\n")
+        print(inp_text)
+        print("\nPaste the corrected input and finish with EOF.\n")
+        inp_text = collect_multiline_until_eof()
+
+# ============================================================
+# Local ORCA executable detection
+# ============================================================
+
+def strip_quotes(text):
+    return str(text).strip().strip('"').strip("'")
+
+
+def find_orca_executable(orca_dir_text):
+    orca_dir = Path(strip_quotes(orca_dir_text)).expanduser()
+
+    if orca_dir.is_file():
+        candidate = orca_dir
+        if candidate.name.lower() in ("orca", "orca.exe"):
+            return candidate.resolve(), candidate.parent.resolve()
+        raise RuntimeError(f"The path is a file, but it is not named orca/orca.exe:\n{candidate}")
+
+    if not orca_dir.exists() or not orca_dir.is_dir():
+        raise RuntimeError(f"ORCA directory does not exist:\n{orca_dir}")
+
+    candidates = [orca_dir / "orca.exe", orca_dir / "orca"]
+    if os.name == "nt":
+        candidates = [orca_dir / "orca.exe", orca_dir / "orca.bat", orca_dir / "orca"]
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate.resolve(), orca_dir.resolve()
+
+    # Sometimes the user gives a parent folder containing a single ORCA subfolder.
+    recursive = []
+    for name in ("orca.exe", "orca"):
+        recursive.extend(list(orca_dir.glob(f"**/{name}")))
+    recursive = [p for p in recursive if p.is_file()]
+    if len(recursive) == 1:
+        candidate = recursive[0]
+        return candidate.resolve(), candidate.parent.resolve()
+
+    raise RuntimeError(
+        "Could not find the ORCA executable in the provided directory.\n"
+        "Expected a file named 'orca.exe' or 'orca'.\n"
+        f"Directory checked: {orca_dir}"
+    )
+
+
+def ask_orca_installation():
+    section("LOCAL ORCA INSTALLATION")
+    print("Provide the directory where ORCA is installed/extracted.")
+    print("Example Windows path: C:\\ORCA")
+    print("Example Linux path  : /home/user/orca_5_0_4\n")
+
+    while True:
+        orca_dir_text = safe_input("ORCA installation/extraction directory: ").strip()
+        if not orca_dir_text:
+            print("  Please provide an ORCA directory.")
+            continue
+        try:
+            orca_exe, orca_dir = find_orca_executable(orca_dir_text)
+            print(f"\nORCA executable found: {orca_exe}")
+            print(f"ORCA directory       : {orca_dir}\n")
+            return str(orca_exe), str(orca_dir)
+        except RuntimeError as err:
+            print("\n" + str(err) + "\n")
+
+
+# ============================================================
+# Microsoft MPI detection for local parallel ORCA
+# ============================================================
+
+def microsoft_mpi_available():
+    """
+    Return (available, mpi_bin_dir).
+
+    On Windows ORCA needs Microsoft MPI for %pal nprocs > 1.
+    If Microsoft MPI is not detected, Step 1 forces nprocs = 1.
+    """
+    if os.name != "nt":
+        return True, None
+
+    default_dirs = [
+        r"C:\Program Files\Microsoft MPI\Bin",
+        r"C:\Program Files (x86)\Microsoft MPI\Bin",
+    ]
+
+    for mpi_bin in default_dirs:
+        mpiexec = os.path.join(mpi_bin, "mpiexec.exe")
+        msmpi_dll = os.path.join(mpi_bin, "msmpi.dll")
+        if os.path.isfile(mpiexec) and os.path.isfile(msmpi_dll):
+            return True, mpi_bin
+
+    mpiexec_path = shutil.which("mpiexec.exe")
+    if mpiexec_path:
+        mpi_bin = os.path.dirname(mpiexec_path)
+        return True, mpi_bin
+
+    return False, None
+
+
+def choose_local_nprocs():
+    section("MICROSOFT MPI / PARALLEL ORCA CHECK")
+
+    mpi_available, mpi_dir = microsoft_mpi_available()
+
+    if os.name == "nt":
+        if mpi_available:
+            print("Microsoft MPI was detected.")
+            print("You may use more than 1 ORCA processor/core.\n")
+        else:
+            print("Microsoft MPI was NOT detected.")
+            print("Local ORCA will be forced to serial mode.")
+            print("Even if you enter more than 1 processor, nprocs will be reset to 1.\n")
+    else:
+        print("Non-Windows system detected.")
+        print("The code will not force serial mode based on Microsoft MPI.\n")
+
+    requested = ask_int("\nNumber of ORCA processors/cores, e.g. 12: ", minimum=1)
+
+    if os.name == "nt" and not mpi_available:
+        if requested > 1:
+            print(f"\nRequested nprocs = {requested}, but Microsoft MPI is not available.")
+            print("Forcing nprocs = 1.\n")
+        return 1, False, None
+
+    return requested, mpi_available, mpi_dir
+
+# ============================================================
+# Parsing and geometry
+# ============================================================
+
+def extract_ele_zpe_from_text(out_text, source_label="output"):
+    ele, zpe = None, None
+    for raw in out_text.splitlines():
+        line = raw.strip()
+        if line.startswith("Electronic energy"):
+            parts = line.split()
+            for i, p in enumerate(parts):
+                if p == "Eh" and i > 0:
+                    ele = float(parts[i - 1])
+                    break
+        if line.startswith("Zero point energy"):
+            parts = line.split()
+            for i, p in enumerate(parts):
+                if p == "Eh" and i > 0:
+                    zpe = float(parts[i - 1])
+                    break
+    if ele is None:
+        raise RuntimeError(f"Could not extract electronic energy from {source_label}")
+    if zpe is None:
+        raise RuntimeError(f"Could not extract zero-point energy from {source_label}")
+    return ele, zpe
+
+
+def extract_final_sp_energy_from_text(out_text, source_label="output"):
+    energies = []
+    for line in out_text.splitlines():
+        if "FINAL SINGLE POINT ENERGY" in line:
+            try:
+                energies.append(float(line.split()[-1]))
+            except Exception:
+                pass
+    if not energies:
+        raise RuntimeError(f"Could not extract FINAL SINGLE POINT ENERGY from {source_label}")
+    return float(energies[-1])
+
+
+def extract_geometry_from_xyz_text(xyz_text, source_label="xyz"):
+    lines = xyz_text.splitlines()
+    if len(lines) < 3:
+        raise RuntimeError(f"XYZ text is too short: {source_label}")
+    natoms = int(lines[0].strip())
+    geom = []
+    for line in lines[2:2 + natoms]:
+        p = line.split()
+        if len(p) >= 4:
+            geom.append(f"{p[0]:<2} {float(p[1]): 18.12f} {float(p[2]): 18.12f} {float(p[3]): 18.12f}")
+    if len(geom) != natoms:
+        raise RuntimeError(f"Could not extract all atoms from {source_label}")
+    return "\n".join(geom)
+
+
+def parse_geometry_to_arrays(geom_text):
+    symbols, coords = [], []
+    for line in geom_text.splitlines():
+        p = line.split()
+        if len(p) >= 4:
+            symbols.append(p[0])
+            coords.append([float(p[1]), float(p[2]), float(p[3])])
+    if not symbols:
+        raise RuntimeError("No valid Cartesian geometry lines were found.")
+    return symbols, np.array(coords, dtype=float)
+
+
+def geometry_from_symbols_coords(symbols, coords):
+    return "\n".join(
+        f"{s:<2} {xyz[0]: 18.12f} {xyz[1]: 18.12f} {xyz[2]: 18.12f}"
+        for s, xyz in zip(symbols, coords)
+    )
+
+
+def interpolate_geometry(geom_a, geom_b, lam):
+    sym_a, xyz_a = parse_geometry_to_arrays(geom_a)
+    sym_b, xyz_b = parse_geometry_to_arrays(geom_b)
+    if sym_a != sym_b:
+        raise RuntimeError("Atom order differs between optimized minima. Interpolation is unsafe.")
+    if xyz_a.shape != xyz_b.shape:
+        raise RuntimeError("Geometry sizes differ between optimized minima.")
+    return geometry_from_symbols_coords(sym_a, (1.0 - lam) * xyz_a + lam * xyz_b)
+
+# ============================================================
+# ORCA templates
+# ============================================================
+
+def default_orca_template(kind):
+    if kind == "minimum":
+        return '''! {method} {basis} TightSCF SlowConv Opt Freq 
+
+%pal nprocs {nprocs} end
+%maxcore {maxcore_mb}
+
+%scf
+  MaxIter 1500
+  SOSCFStart 0.01
+  LevelShift 0.5
+end
+
+%output
+  PrintLevel 3
+end
+
+* xyz {charge} {mult}
+{geom}
+*
+'''
+    if kind == "single_point":
+        return '''! {method} {basis} TightSCF SlowConv
+
+%pal nprocs {nprocs} end
+%maxcore {maxcore_mb}
+
+%scf
+  MaxIter 1500
+  SOSCFStart 0.01
+  LevelShift 0.5
+end
+
+%output
+  PrintLevel 3
+end
+
+* xyz {charge} {mult}
+{geom}
+*
+'''
+    if kind == "mecp":
+        return '''! {method} {basis} SurfCrossOpt TightSCF SlowConv
+
+%pal nprocs {nprocs} end
+%maxcore {maxcore_mb}
+
+%scf
+  MaxIter 1500
+  SOSCFStart 0.01
+  LevelShift 0.5
+end
+
+%mecp Mult {mult_other}
+end
+
+%output
+  PrintLevel 3
+end
+
+* xyz {charge} {mult}
+{geom}
+*
+'''
+    raise ValueError(kind)
+
+
+def review_orca_templates_once(example_geometry, example_charge, example_mult_a, example_mult_b):
+    global ORCA_INPUT_TEMPLATES, ORCA_INPUT_TEMPLATES_WERE_REVIEWED, ORCA_INPUT_TEMPLATE_SOURCE
+
+    if globals().get("ORCA_INPUT_TEMPLATES_WERE_REVIEWED", False):
+        return
+
+    section("ORCA INPUT TEMPLATE REVIEW")
+    print("Default electronic-structure settings for Step 1 are listed below.")
+    print("You will be asked whether you wish to modify these settings before calculations are run.")
+    print("  Method    : PBE")
+    print("  Basis set : def2-TZVP")
+
+    ORCA_INPUT_TEMPLATES = {
+        "minimum": default_orca_template("minimum"),
+        "single_point": default_orca_template("single_point"),
+        "mecp": default_orca_template("mecp"),
+    }
+
+    print("\nThe input below is default for low-spin minimum optimization:\n")
+    low_spin_example = ORCA_INPUT_TEMPLATES["minimum"].format(
+        method=method,
+        basis=basis,
+        charge=example_charge,
+        mult=example_mult_a,
+        mult_other=example_mult_b,
+        geom=example_geometry,
+        nprocs=nprocs,
+        maxcore_mb=maxcore_mb
+    )
+    print(low_spin_example)
+
+    if ask_yes_no("Edit the low-spin ORCA input template before running?", default=False):
+        print("\nPaste the complete edited low-spin minimum template.")
+        print("Finish with EOF.\n")
+        edited = collect_multiline_until_eof()
+        validate_placeholders(
+            edited,
+            ["{method}", "{basis}", "{charge}", "{mult}", "{geom}", "{nprocs}", "{maxcore_mb}"],
+            "low-spin minimum"
+        )
+        edited = enforce_minimum_input_requirements(edited, "low-spin minimum template")
+        ORCA_INPUT_TEMPLATES["minimum"] = edited
+
+    print("\nThe input below is default for high-spin minimum optimization:\n")
+    high_spin_example = ORCA_INPUT_TEMPLATES["minimum"].format(
+        method=method,
+        basis=basis,
+        charge=example_charge,
+        mult=example_mult_b,
+        mult_other=example_mult_a,
+        geom=example_geometry,
+        nprocs=nprocs,
+        maxcore_mb=maxcore_mb
+    )
+    print(high_spin_example)
+
+    if ask_yes_no("Edit the high-spin ORCA input template before running?", default=False):
+        print("\nPaste the complete edited high-spin minimum template.")
+        print("Finish with EOF.\n")
+        edited = collect_multiline_until_eof()
+        validate_placeholders(
+            edited,
+            ["{method}", "{basis}", "{charge}", "{mult}", "{geom}", "{nprocs}", "{maxcore_mb}"],
+            "high-spin minimum"
+        )
+        edited = enforce_minimum_input_requirements(edited, "high-spin minimum template")
+        ORCA_INPUT_TEMPLATES["minimum"] = edited
+
+    ORCA_INPUT_TEMPLATE_SOURCE = "Default PBE/def2-TZVP Step 1 templates with reviewed minimum inputs"
+    ORCA_INPUT_TEMPLATES_WERE_REVIEWED = True
+    print("\nORCA input templates finalized.\n")
+
+# ============================================================
+# Protected ORCA input repair system
+# ============================================================
+
+def normalize_geometry_text(geom_text):
+    lines = []
+    for line in str(geom_text).splitlines():
+        p = line.split()
+        if len(p) >= 4:
+            lines.append(f"{p[0]} {float(p[1]):.10f} {float(p[2]):.10f} {float(p[3]):.10f}")
+    return "\n".join(lines)
+
+
+def split_orca_xyz_block(inp_text):
+    lines = inp_text.splitlines()
+    xyz_start = None
+    for i, line in enumerate(lines):
+        if line.strip().lower().startswith("* xyz"):
+            xyz_start = i
+            break
+    if xyz_start is None:
+        raise RuntimeError("Could not find '* xyz charge multiplicity' block.")
+
+    xyz_end = None
+    for j in range(xyz_start + 1, len(lines)):
+        if lines[j].strip() == "*":
+            xyz_end = j
+            break
+    if xyz_end is None:
+        raise RuntimeError("Could not find closing '*' for xyz block.")
+
+    pre_xyz = "\n".join(lines[:xyz_start]).rstrip() + "\n"
+    xyz_block = "\n".join(lines[xyz_start:xyz_end + 1]).rstrip() + "\n"
+    post_xyz = "\n".join(lines[xyz_end + 1:]).rstrip()
+    return pre_xyz, xyz_block, post_xyz
+
+
+
+# ============================================================
+# ORCA reusable DFT settings propagation
+# ============================================================
+
+ORCA_JOB_KEYWORDS = {
+    "opt", "freq", "numfreq", "engrad", "surfcrossopt",
+    "surfcrossnumfreq", "sp"
+}
+
+def ask_nonempty_text(prompt, default=None):
+    while True:
+        ans = safe_input(prompt).strip()
+        if ans:
+            return ans
+        if default is not None:
+            return str(default)
+        print("  Input cannot be empty.")
+
+
+def extract_bang_line_from_pre(pre_text):
+    for line in str(pre_text).splitlines():
+        if line.strip().startswith("!"):
+            return line.strip()
+    raise RuntimeError("Could not find ORCA ! line in the editable settings block.")
+
+
+def extract_orca_percent_blocks_from_pre(pre_text, exclude_names=None):
+    """Extract every ORCA % block/line from the pre-geometry region."""
+    exclude_names = {str(x).lower() for x in (exclude_names or [])}
+    lines = str(pre_text).splitlines()
+    blocks = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped.startswith("%"):
+            i += 1
+            continue
+
+        block_name = stripped[1:].split()[0].lower()
+        block_lines = [line]
+        i += 1
+
+        # %maxcore is a one-line directive. Blocks such as "%pal ... end"
+        # are also treated as one-line blocks if they already end with "end".
+        if stripped.lower().endswith(" end") or block_name == "maxcore":
+            pass
+        else:
+            while i < len(lines):
+                block_lines.append(lines[i])
+                if lines[i].strip().lower() == "end":
+                    i += 1
+                    break
+                i += 1
+
+        if block_name not in exclude_names:
+            blocks.append("\n".join(block_lines).rstrip())
+
+    return ("\n\n".join(blocks).strip() + "\n\n") if blocks else ""
+
+
+def adapt_bang_line_for_job(bang_line, job_type):
+    tokens = str(bang_line).strip().split()
+    if not tokens or tokens[0] != "!":
+        raise RuntimeError("Editable ORCA settings block must start with a ! line.")
+
+    clean = [tok for tok in tokens[1:] if tok.lower() not in ORCA_JOB_KEYWORDS]
+    job_type = str(job_type).lower()
+
+    if job_type == "minimum":
+        new_body = clean + ["Opt", "Freq"]
+    elif job_type == "single_point":
+        new_body = clean
+    elif job_type == "mecp":
+        new_body = clean + ["SurfCrossOpt"]
+    elif job_type == "engrad":
+        new_body = ["Engrad"] + clean
+    elif job_type == "freq":
+        new_body = clean + ["SurfCrossNumFreq"]
+    else:
+        raise RuntimeError(f"Unknown ORCA job_type for header adaptation: {job_type}")
+
+    return "! " + " ".join(new_body).strip()
+
+
+def build_orca_input_from_pre_xyz(pre_xyz_text, charge_i, mult_i, geom_i):
+    pre = str(pre_xyz_text).rstrip()
+    return f"{pre}\n\n* xyz {int(charge_i)} {int(mult_i)}\n{geom_i}\n*\n"
+
+
+def make_dft_pre_xyz(job_type, job_specific_blocks=""):
+    base_pre = globals().get("DFT_REVIEWED_PRE_XYZ", "")
+
+    if not base_pre.strip():
+        base_pre = f"""! {method} {basis} TightSCF SlowConv Opt Freq
+
+%pal nprocs {nprocs} end
+%maxcore {maxcore_mb}
+
+%scf
+  MaxIter 1500
+  SOSCFStart 0.01
+  LevelShift 0.5
+end
+
+%output
+  PrintLevel 3
+end
+"""
+
+    header = adapt_bang_line_for_job(
+        extract_bang_line_from_pre(base_pre),
+        job_type
+    )
+
+    # Reuse the same reviewed/default ORCA percent blocks for every DFT job.
+    # This includes minimum, interpolation, MECP, Engrad, and SurfCrossNumFreq.
+    # If an individual ORCA job fails, its input may still be edited interactively
+    # before that failed job is resubmitted.
+    blocks = globals().get(
+        "ORCA_TRANSFER_BLOCKS_ALL",
+        ""
+    )
+
+    if not blocks.strip():
+        blocks = extract_orca_percent_blocks_from_pre(base_pre)
+
+    text = header.rstrip() + "\n\n"
+
+    if blocks.strip():
+        text += blocks.rstrip() + "\n\n"
+
+    if str(job_specific_blocks).strip():
+        text += str(job_specific_blocks).strip() + "\n\n"
+
+    return text.rstrip() + "\n"
+
+
+def apply_dft_settings_to_input(inp_text, job_type, job_specific_blocks=""):
+    _, xyz_block, post_xyz = split_orca_xyz_block(inp_text)
+    new_pre = make_dft_pre_xyz(job_type, job_specific_blocks=job_specific_blocks)
+    out = new_pre.rstrip() + "\n\n" + xyz_block
+    if post_xyz.strip():
+        out += "\n" + post_xyz.strip() + "\n"
+    return out
+
+
+def parse_xyz_charge_mult_geom(inp_text):
+    _, xyz_block, _ = split_orca_xyz_block(inp_text)
+    lines = xyz_block.splitlines()
+    first = lines[0].split()
+    if len(first) < 4:
+        raise RuntimeError("Malformed xyz line. Expected: * xyz charge multiplicity")
+    charge_i = int(first[2])
+    mult_i = int(first[3])
+    geom_i = "\n".join(lines[1:-1])
+    return charge_i, mult_i, geom_i
+
+
+def first_bang_line(inp_text):
+    for line in inp_text.splitlines():
+        if line.strip().startswith("!"):
+            return line.strip()
+    return ""
+
+
+def require_keyword_in_bang(inp_text, keyword, label):
+    bang = first_bang_line(inp_text).lower()
+    if keyword.lower() not in bang.split():
+        raise RuntimeError(f"{label}: required keyword '{keyword}' is missing from the ORCA ! line.")
+
+
+def require_text_in_bang(inp_text, text, label):
+    bang = first_bang_line(inp_text).lower()
+    if str(text).lower() not in bang:
+        raise RuntimeError(f"{label}: required setting '{text}' is missing from the ORCA ! line.")
+
+
+def require_exact_xyz(inp_text, expected_charge, expected_mult, expected_geom, label):
+    charge_i, mult_i, geom_i = parse_xyz_charge_mult_geom(inp_text)
+    if int(charge_i) != int(expected_charge):
+        raise RuntimeError(f"{label}: charge was changed. It must remain {expected_charge}.")
+    if int(mult_i) != int(expected_mult):
+        raise RuntimeError(f"{label}: multiplicity was changed. It must remain {expected_mult}.")
+    if normalize_geometry_text(geom_i) != normalize_geometry_text(expected_geom):
+        raise RuntimeError(f"{label}: geometry was changed. Geometry is protected for this step.")
+
+
+def require_mecp_mult(inp_text, expected_mecp_mult, label):
+    m = re.search(r"%mecp\s+Mult\s+([0-9]+)", inp_text, flags=re.IGNORECASE)
+    if not m:
+        raise RuntimeError(f"{label}: required '%mecp Mult {expected_mecp_mult}' block is missing.")
+    found = int(m.group(1))
+    if found != int(expected_mecp_mult):
+        raise RuntimeError(f"{label}: %mecp Mult was changed to {found}. It must remain {expected_mecp_mult}.")
+
+
+def validate_repaired_input(inp_text, policy, locked, label):
+    if policy == "free_full":
+        return inp_text
+    if policy == "free_minimum":
+        return enforce_minimum_input_requirements(inp_text, label)
+    if policy == "interp_header_only":
+        require_text_in_bang(inp_text, locked["method"], label)
+        require_text_in_bang(inp_text, locked["basis"], label)
+        return inp_text
+    if policy == "mecp_restricted":
+        require_text_in_bang(inp_text, locked["method"], label)
+        require_text_in_bang(inp_text, locked["basis"], label)
+        require_keyword_in_bang(inp_text, "SurfCrossOpt", label)
+        require_exact_xyz(inp_text, locked["charge"], locked["mult"], locked["geom"], label)
+        require_mecp_mult(inp_text, locked["mecp_mult"], label)
+        return inp_text
+    if policy == "engrad_restricted":
+        require_keyword_in_bang(inp_text, "Engrad", label)
+        require_text_in_bang(inp_text, locked["method"], label)
+        require_text_in_bang(inp_text, locked["basis"], label)
+        require_exact_xyz(inp_text, locked["charge"], locked["mult"], locked["geom"], label)
+        return inp_text
+    if policy == "rohf_restricted":
+        require_keyword_in_bang(inp_text, locked["method"], label)
+        require_text_in_bang(inp_text, locked["basis"], label)
+        require_exact_xyz(inp_text, locked["charge"], locked["mult"], locked["geom"], label)
+        return inp_text
+    if policy == "soc_restricted":
+        require_text_in_bang(inp_text, locked["basis"], label)
+        require_exact_xyz(inp_text, locked["charge"], locked["mult"], locked["geom"], label)
+        for required_mult in locked["soc_mults"]:
+            if str(required_mult) not in inp_text:
+                raise RuntimeError(f"{label}: required SOC multiplicity {required_mult} is missing.")
+        return inp_text
+    if policy == "freq_restricted":
+        require_text_in_bang(inp_text, locked["method"], label)
+        require_text_in_bang(inp_text, locked["basis"], label)
+        require_keyword_in_bang(inp_text, "SurfCrossNumFreq", label)
+        require_exact_xyz(inp_text, locked["charge"], locked["mult"], locked["geom"], label)
+        require_mecp_mult(inp_text, locked["mecp_mult"], label)
+        return inp_text
+    raise RuntimeError(f"Unknown ORCA repair policy: {policy}")
+
+
+def edit_failed_input_with_policy(inp_text, job_label, repair_policy="free_full", locked=None):
+    locked = locked or {}
+    section("ORCA INPUT REVISION REQUIRED")
+    print("WARNING: ORCA did not terminate normally.")
+    print(f"Failed calculation: {job_label}\n")
+
+    if repair_policy == "interp_header_only":
+        pre_xyz, xyz_block, _ = split_orca_xyz_block(inp_text)
+        print("Only the pre-geometry ORCA settings block is editable for interpolation jobs.")
+        print("The geometry, charge, and multiplicity are protected because interpolation")
+        print("uses automatically generated geometries.\n")
+        print("Current editable block:\n")
+        print(pre_xyz)
+        print("\nModify convergence/header settings only.")
+        print("Paste the corrected pre-geometry block and finish with EOF.\n")
+        edited_pre = collect_multiline_until_eof().rstrip() + "\n"
+        repaired = edited_pre + "\n" + xyz_block
+    else:
+        print("Current input is shown below.")
+        print("Paste the corrected input and finish with EOF.\n")
+        print(inp_text)
+        repaired = collect_multiline_until_eof()
+
+    while True:
+        try:
+            repaired = validate_repaired_input(repaired, repair_policy, locked, job_label)
+            return repaired
+        except RuntimeError as err:
+            print("\nINPUT VALIDATION FAILED:")
+            print(err)
+            print("\nPlease edit again. Finish with EOF.\n")
+            if repair_policy == "interp_header_only":
+                repaired_pre = collect_multiline_until_eof().rstrip() + "\n"
+                repaired = repaired_pre + "\n" + xyz_block
+            else:
+                repaired = collect_multiline_until_eof()
+
+# ============================================================
+# Local ORCA job execution
+# ============================================================
+
+def local_out_status(local_dir, basename):
+    out_path = Path(local_dir) / f"{basename}.out"
+    if not out_path.exists():
+        return "MISSING"
+    text = out_path.read_text(encoding="utf-8", errors="ignore")
+    low = text.lower()
+    if "orca terminated normally" in low:
+        return "OK"
+    if "error termination" in low or "orca finished by error termination" in low:
+        return "ERROR"
+    return "FAILED"
+
+
+def local_tail(local_dir, filename, n_lines=100):
+    path = Path(local_dir) / filename
+    if not path.exists():
+        return ""
+    lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    return "\n".join(lines[-n_lines:])
+
+
+def archive_local_job_files(local_dir, basename, label):
+    local_dir = Path(local_dir)
+    archive_dir = local_dir / f"{label}_{basename}_{time.strftime('%Y%m%d_%H%M%S')}"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    moved = False
+    for path in local_dir.glob(f"{basename}.*"):
+        if path.is_file():
+            shutil.move(str(path), str(archive_dir / path.name))
+            moved = True
+    if not moved:
+        try:
+            archive_dir.rmdir()
+        except Exception:
+            pass
+
+
+def run_orca_local(local_dir, inp_filename, out_filename):
+    local_dir = Path(local_dir)
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+
+    path_parts = [str(ORCA_DIR)]
+
+    if globals().get("MPI_AVAILABLE", False) and globals().get("MPI_DIR", None):
+        path_parts.append(str(MPI_DIR))
+
+    path_parts.append(env.get("PATH", ""))
+    env["PATH"] = os.pathsep.join(path_parts)
+
+    out_path = local_dir / out_filename
+    inp_path = local_dir / inp_filename
+
+    with open(out_path, "w", encoding="utf-8", newline="\n") as out_handle:
+        result = subprocess.run(
+            [str(ORCA_EXE), str(inp_path.name)],
+            cwd=str(local_dir),
+            stdout=out_handle,
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True
+        )
+
+    return result.returncode
+
+
+def build_local_job(local_dir, jobname_i, inp_text):
+    local_dir = Path(local_dir)
+    local_dir.mkdir(parents=True, exist_ok=True)
+    inp_filename = f"{jobname_i}.inp"
+    out_filename = f"{jobname_i}.out"
+    inp_path = local_dir / inp_filename
+    write_text(inp_path, inp_text)
+    return {
+        "inp_filename": inp_filename,
+        "out_filename": out_filename,
+        "local_inp": str(inp_path),
+        "local_out": str(local_dir / out_filename)
+    }
+
+
+def submit_and_monitor_orca_job(
+    remote_dir,
+    jobname_i,
+    inp_text,
+    job_label,
+    allow_interactive_repair=True,
+    repair_policy="free_full",
+    locked=None
+):
+    """
+    Cluster-compatible name retained for later workflow compatibility.
+    In LOCAL mode, remote_dir is simply the local working directory.
+    """
+    current_inp = inp_text
+    attempt = 1
+    locked = locked or {}
+    local_dir = Path(remote_dir)
+
+    while True:
+        status_before = local_out_status(local_dir, jobname_i)
+
+        if status_before == "OK":
+            print(f"Completed output already exists for {job_label}. Skipping.")
+            return "OK", current_inp
+
+        if status_before in ("ERROR", "FAILED"):
+            print(f"Existing non-normal output detected for {job_label}. Archiving old files.")
+            archive_local_job_files(local_dir, jobname_i, "previous_failed")
+
+        files = build_local_job(local_dir, jobname_i, current_inp)
+
+        section(f"RUNNING LOCAL ORCA JOB | {job_label}")
+        print(f"Local directory : {local_dir}")
+        print(f"Attempt         : {attempt}")
+        print(f"Input file      : {files['inp_filename']}")
+        print(f"Output file     : {files['out_filename']}")
+        print(f"ORCA executable : {ORCA_EXE}")
+
+        return_code = run_orca_local(local_dir, files["inp_filename"], files["out_filename"])
+        status_now = local_out_status(local_dir, jobname_i)
+
+        if status_now == "OK":
+            print(f"{job_label} completed successfully.")
+            return "OK", current_inp
+
+        section(f"NON-NORMAL TERMINATION | {job_label}")
+        print("WARNING: ORCA did not terminate normally.")
+        print(f"Detected status : {status_now}")
+        print(f"Return code     : {return_code}")
+        print(f"Output file     : {local_dir / (jobname_i + '.out')}")
+
+        tail_text = local_tail(local_dir, f"{jobname_i}.out", 100)
+        if tail_text.strip():
+            subsection("Last 100 lines of output")
+            print(tail_text)
+
+        if not allow_interactive_repair:
+            return status_now, current_inp
+
+        if not ask_yes_no("Edit this ORCA input and rerun?", default=True):
+            return status_now, current_inp
+
+        current_inp = edit_failed_input_with_policy(
+            current_inp,
+            job_label,
+            repair_policy=repair_policy,
+            locked=locked
+        )
+
+        archive_local_job_files(local_dir, jobname_i, "failed_attempt")
+        attempt += 1
+
+
+def submit_orca_job_no_monitor(remote_dir, jobname_i, inp_text, job_label, attempt=1):
+    """
+    Local compatibility wrapper. Unlike the cluster version, this runs the job
+    immediately and returns only after ORCA finishes.
+    """
+    status, final_inp = submit_and_monitor_orca_job(
+        remote_dir=remote_dir,
+        jobname_i=jobname_i,
+        inp_text=inp_text,
+        job_label=job_label,
+        allow_interactive_repair=True,
+        repair_policy="free_full",
+        locked={}
+    )
+    return {
+        "jobname": jobname_i,
+        "job_label": job_label,
+        "status": status,
+        "short_id": "LOCAL",
+        "inp_text": final_inp,
+        "attempt": attempt
+    }
+
+
+def monitor_submitted_orca_jobs(remote_dir, submitted_jobs, allow_interactive_repair=True):
+    """
+    Local compatibility wrapper. Jobs were already run by submit_orca_job_no_monitor.
+    """
+    return submitted_jobs
+
+# ============================================================
+# Local ORCA and user input
+# ============================================================
+
+ORCA_EXE, ORCA_DIR = ask_orca_installation()
+
+section("MOLECULAR AND COMPUTATIONAL INPUT")
+
+jobname = safe_input(
+    "Please provide a name for your input file without extension, e.g. Iron_Cluster: "
+).strip()
+while not jobname:
+    jobname = safe_input("Project/job name without extension, e.g. Paper_2: ").strip()
+
+multiplicities = parse_int_list(
+    safe_input("\nEnter the two spin multiplicities, e.g. 3,5 or 4,6, etc: ").strip()
+)
+if len(multiplicities) != 2:
+    raise RuntimeError("This workflow expects exactly two multiplicities, for example 3,5.")
+
+charge = ask_int("Charge of the species, e.g. -2 or 0 or 3, etc: ")
+
+default_method = "PBE"
+default_basis = "def2-TZVP"
+
+print("\nDefault Step 1 electronic-structure settings:")
+print(f"  Method/level of theory : {default_method}")
+print(f"  Basis set              : {default_basis}")
+print("These values are used to build the initial DFT header.")
+print("You can still edit the generated pre-geometry ORCA settings block once before local runs.\n")
+
+method = ask_nonempty_text(
+    f"Level of theory / method for DFT jobs, e.g. B3LYP D3 (default {default_method}): ",
+    default=default_method
+)
+
+basis = ask_nonempty_text(
+    f"Basis set for all jobs, e.g. def2-TZVP or 6-31G(d) (default {default_basis}): ",
+    default=default_basis
+)
+
+nprocs, MPI_AVAILABLE, MPI_DIR = choose_local_nprocs()
+mem_gb = ask_int("ORCA %maxcore memory per core in GB, e.g. 8: ", minimum=1)
+maxcore_mb = mem_gb * 1000
+
+n_interp = 10
+
+Initial_geometry = read_geometry_block(
+    "Paste the initial guess Cartesian geometry. This geometry is used to optimize the spin-state minima for your requested multiplicities. It is protected and cannot be edited during ORCA input-file editing."
+)
+
+ORCA_INPUT_TEMPLATES = {
+    "minimum": default_orca_template("minimum"),
+    "single_point": default_orca_template("single_point"),
+    "mecp": default_orca_template("mecp"),
+}
+
+ORCA_INPUT_TEMPLATES_WERE_REVIEWED = True
+ORCA_INPUT_TEMPLATE_SOURCE = "User-entered method/basis with one shared reviewed DFT pre-geometry block"
+
+# ============================================================
+# Directories
+# ============================================================
+
+section("DIRECTORY PREPARATION")
+
+# Project folder is created INSIDE the ORCA installation directory.
+# Example on Windows:
+#   C:\ORCA\Spin_Inversion_Paper_2
+local_base = os.path.join(str(ORCA_DIR), f"Spin_Inversion_{jobname}")
+local_minima = os.path.join(local_base, "Minima")
+local_interp = os.path.join(local_base, "Interpolation_scan")
+local_mecp = os.path.join(local_base, "MECP")
+
+for d in (local_base, local_minima, local_interp, local_mecp):
+    os.makedirs(d, exist_ok=True)
+
+# Backward-compatible aliases for later Local PC steps.
+remote_base = local_base
+remote_minima = local_minima
+remote_interp = local_interp
+remote_mecp = local_mecp
+
+print(f"Local base directory          : {local_base}")
+print(f"Local minima directory        : {local_minima}")
+print(f"Local interpolation directory : {local_interp}")
+print(f"Local MECP directory          : {local_mecp}")
+
+low_spin_mult = min(multiplicities)
+high_spin_mult = max(multiplicities)
+
+# The Local PC version asks for minimum-input editing only once per
+# multiplicity, in the MINIMUM INPUT FILE REVIEW section below. Therefore
+# the separate template-review prompt is intentionally not called here.
+
+# ============================================================
+# Minima input review
+# ============================================================
+
+section("MINIMUM INPUT FILE REVIEW")
+
+minima_inputs = {}
+
+for mult in [low_spin_mult, high_spin_mult]:
+    spin_name = multiplicity_name(mult)
+    job_i = f"{jobname}_{spin_name}_min"
+
+    inp_text = ORCA_INPUT_TEMPLATES["minimum"].format(
+        method=method,
+        basis=basis,
+        charge=charge,
+        mult=mult,
+        mult_other=high_spin_mult if mult == low_spin_mult else low_spin_mult,
+        geom=Initial_geometry,
+        nprocs=nprocs,
+        maxcore_mb=maxcore_mb
+    )
+
+    minima_inputs[mult] = {
+        "spin_name": spin_name,
+        "jobname": job_i,
+        "inp_text": inp_text
+    }
+
+print("\nThe two complete minimum input files generated from your method/basis are shown below.")
+print("The geometry, charge, and multiplicity are protected. If you edit, you will edit only")
+print("the ORCA settings block before the * xyz line; that same settings block will be")
+print("propagated to interpolation, MECP, Engrad, and frequency-style DFT jobs.\n")
+
+for mult in [low_spin_mult, high_spin_mult]:
+    job_i = minima_inputs[mult]["jobname"]
+    existing_status = local_out_status(local_minima, job_i)
+
+    subsection(f"Complete generated minimum input | {job_i}.inp")
+    print(minima_inputs[mult]["inp_text"])
+
+    if existing_status == "OK":
+        print(f"Completed minimum output already exists for {job_i}; this job will be skipped if run.")
+
+default_pre_xyz, _, _ = split_orca_xyz_block(minima_inputs[low_spin_mult]["inp_text"])
+reviewed_pre_xyz = default_pre_xyz
+
+if ask_yes_no("Edit the shared ORCA settings block before minimum runs?", default=False):
+    section("EDIT SHARED PRE-GEOMETRY ORCA SETTINGS")
+    print("Edit only the block below. Do NOT include the * xyz line, charge, multiplicity,")
+    print("geometry, or final '*' line. The edited block will be applied to both minimum")
+    print("inputs with their correct protected charge/multiplicity/geometry.\n")
+    print("Current shared editable block:\n")
+    print(default_pre_xyz)
+    print("\nPaste the corrected pre-geometry block and finish with EOF.\n")
+
+    reviewed_pre_xyz = collect_multiline_until_eof()
+
+    if "* xyz" in reviewed_pre_xyz.lower():
+        raise RuntimeError("The edited shared settings block must not contain a '* xyz' geometry block.")
+
+    if not first_bang_line(reviewed_pre_xyz):
+        raise RuntimeError("The edited shared settings block must contain an ORCA ! line.")
+
+DFT_REVIEWED_PRE_XYZ = reviewed_pre_xyz.rstrip() + "\n"
+ORCA_TRANSFER_BLOCKS_ALL = extract_orca_percent_blocks_from_pre(
+    DFT_REVIEWED_PRE_XYZ,
+    exclude_names=[]
+)
+ORCA_TRANSFER_BLOCKS_NO_OUTPUT = extract_orca_percent_blocks_from_pre(
+    DFT_REVIEWED_PRE_XYZ,
+    exclude_names=["output"]
+)
+
+for mult in [low_spin_mult, high_spin_mult]:
+    final_min_inp = build_orca_input_from_pre_xyz(
+        make_dft_pre_xyz("minimum"),
+        charge,
+        mult,
+        Initial_geometry
+    )
+
+    final_min_inp = enforce_minimum_input_requirements(
+        final_min_inp,
+        minima_inputs[mult]["jobname"]
+    )
+
+    minima_inputs[mult]["inp_text"] = final_min_inp
+
+print("\nMinimum input files finalized.")
+print("The reviewed DFT header and all % blocks have been captured for propagation.")
+print("Interpolation and MECP input files will be generated automatically.\n")
+
+# ============================================================
+# Minima
+# ============================================================
+
+section("MINIMUM OPTIMIZATIONS")
+
+minima_data = {}
+submitted_minima_jobs = []
+
+for mult in multiplicities:
+    spin_name = minima_inputs[mult]["spin_name"]
+    job_i = minima_inputs[mult]["jobname"]
+    inp_text = minima_inputs[mult]["inp_text"]
+
+    status, final_inp = submit_and_monitor_orca_job(
+        local_minima,
+        job_i,
+        inp_text,
+        f"{spin_name} minimum Opt/Freq",
+        allow_interactive_repair=True,
+        repair_policy="free_minimum",
+        locked={}
+    )
+
+    submitted_minima_jobs.append({
+        "jobname": job_i,
+        "job_label": f"{spin_name} minimum Opt/Freq",
+        "status": status,
+        "inp_text": final_inp,
+        "mult": mult,
+        "spin_name": spin_name
+    })
+
+for job_record in submitted_minima_jobs:
+    if job_record["status"] != "OK":
+        raise SystemExit(f"{job_record['jobname']} did not complete successfully.")
+
+for mult in multiplicities:
+    spin_name = minima_inputs[mult]["spin_name"]
+    job_i = minima_inputs[mult]["jobname"]
+
+    matching_jobs = [job for job in submitted_minima_jobs if job["jobname"] == job_i]
+    final_inp = matching_jobs[0]["inp_text"] if matching_jobs else minima_inputs[mult]["inp_text"]
+
+    out_path = os.path.join(local_minima, f"{job_i}.out")
+    xyz_path = os.path.join(local_minima, f"{job_i}.xyz")
+
+    if not file_exists(xyz_path):
+        raise RuntimeError(f"Optimized XYZ file was not found:\n{xyz_path}")
+
+    out_text = read_text(out_path)
+    xyz_text = read_text(xyz_path)
+
+    ele, zpe = extract_ele_zpe_from_text(out_text, out_path)
+    geom = extract_geometry_from_xyz_text(xyz_text, xyz_path)
+
+    write_text(os.path.join(local_minima, f"{job_i}.inp"), final_inp)
+
+    minima_data[mult] = {
+        "spin_name": spin_name,
+        "jobname": job_i,
+        "out_path": out_path,
+        "xyz_path": xyz_path,
+        "Electronic_Eh": ele,
+        "ZPE_Eh": zpe,
+        "E_plus_ZPE_Eh": ele + zpe,
+        "geometry": geom
+    }
+
+# ============================================================
+# Reference selection
+# ============================================================
+
+section("MINIMA ENERGY SUMMARY AND REFERENCE SELECTION")
+
+hartree_to_cm = 219474.6
+hartree_to_kcal = 627.509474
+
+sorted_mults = sorted(multiplicities, key=lambda m: minima_data[m]["E_plus_ZPE_Eh"])
+reference_multiplicity = sorted_mults[0]
+other_multiplicity = sorted_mults[1]
+
+Reference_multiplicity = reference_multiplicity
+Reference_geometry = minima_data[reference_multiplicity]["geometry"]
+
+Reference_source = (
+    f"Automatically selected lower electronic-plus-ZPE minimum: multiplicity "
+    f"{Reference_multiplicity} ({minima_data[Reference_multiplicity]['spin_name']})"
+)
+
+E0 = minima_data[reference_multiplicity]["E_plus_ZPE_Eh"]
+
+for mult in multiplicities:
+    dEh = minima_data[mult]["E_plus_ZPE_Eh"] - E0
+    print(f"Multiplicity {mult} ({minima_data[mult]['spin_name']}):")
+    print(f"  Electronic energy       = {minima_data[mult]['Electronic_Eh']:.12f} Eh")
+    print(f"  Zero-point energy       = {minima_data[mult]['ZPE_Eh']:.12f} Eh")
+    print(f"  Electronic + ZPE        = {minima_data[mult]['E_plus_ZPE_Eh']:.12f} Eh")
+    print(f"  Relative E+ZPE          = {dEh * hartree_to_cm:.6f} cm^-1")
+    print(f"  Relative E+ZPE          = {dEh * hartree_to_kcal:.6f} kcal/mol\n")
+
+print(f"Reference multiplicity: {Reference_multiplicity}")
+
+# ============================================================
+# Interpolation scan
+# ============================================================
+
+section("CARTESIAN INTERPOLATION SCAN")
+
+mult_a, mult_b = multiplicities
+geom_a = minima_data[mult_a]["geometry"]
+geom_b = minima_data[mult_b]["geometry"]
+
+interp_records = []
+interp_jobs_by_index = {}
+
+for i in range(n_interp):
+    lam = i / (n_interp - 1)
+    geom_i = interpolate_geometry(geom_a, geom_b, lam)
+    symbols, coords = parse_geometry_to_arrays(geom_i)
+
+    local_xyz = os.path.join(local_interp, f"{jobname}_interp_{i+1:03d}_lambda_{lam:.4f}.xyz")
+    write_text(local_xyz, f"{len(symbols)}\nlambda = {lam:.8f}\n{geom_i}\n")
+
+    interp_jobs_by_index[i + 1] = {
+        "index": i + 1,
+        "lambda": lam,
+        "geometry": geom_i,
+        "geometry_file": local_xyz,
+        "local_geometry_file": local_xyz,
+        "jobs": []
+    }
+
+    for mult in multiplicities:
+        spin_name = multiplicity_name(mult)
+        sp_job = f"{jobname}_interp_{i+1:03d}_lam_{lam:.4f}_mult_{mult}_{spin_name}"
+
+        sp_inp = ORCA_INPUT_TEMPLATES["single_point"].format(
+            method=method,
+            basis=basis,
+            charge=charge,
+            mult=mult,
+            mult_other=multiplicities[1] if mult == multiplicities[0] else multiplicities[0],
+            geom=geom_i,
+            nprocs=nprocs,
+            maxcore_mb=maxcore_mb
+        )
+
+        sp_inp = apply_dft_settings_to_input(sp_inp, "single_point")
+
+        interp_jobs_by_index[i + 1]["jobs"].append({
+            "mult": mult,
+            "spin_name": spin_name,
+            "jobname": sp_job,
+            "inp_text": sp_inp,
+            "label": f"interpolation SP {i+1:03d}, mult {mult}"
+        })
+
+for idx in range(1, n_interp + 1):
+    section(f"INTERPOLATION POINT {idx:03d}/{n_interp:03d}")
+    submitted_interp_jobs = []
+
+    for job in interp_jobs_by_index[idx]["jobs"]:
+        status, final_inp = submit_and_monitor_orca_job(
+            local_interp,
+            job["jobname"],
+            job["inp_text"],
+            job["label"],
+            allow_interactive_repair=True,
+            repair_policy="interp_header_only",
+            locked={"method": method, "basis": basis}
+        )
+
+        submitted_interp_jobs.append({
+            "jobname": job["jobname"],
+            "job_label": job["label"],
+            "status": status,
+            "inp_text": final_inp,
+            "interp_index": idx,
+            "mult": job["mult"],
+            "spin_name": job["spin_name"]
+        })
+
+    for job_record in submitted_interp_jobs:
+        if job_record["status"] != "OK":
+            raise SystemExit(f"{job_record['jobname']} did not complete successfully.")
+
+    energies = {}
+    for job_record in submitted_interp_jobs:
+        mult = job_record["mult"]
+        sp_job = job_record["jobname"]
+        out_text = read_text(os.path.join(local_interp, f"{sp_job}.out"))
+        energies[mult] = extract_final_sp_energy_from_text(out_text, sp_job)
+
+    if mult_a not in energies or mult_b not in energies:
+        raise RuntimeError(f"Missing one or more interpolation energies for point {idx:03d}.")
+
+    lam = interp_jobs_by_index[idx]["lambda"]
+    geom_i = interp_jobs_by_index[idx]["geometry"]
+    local_xyz = interp_jobs_by_index[idx]["local_geometry_file"]
+
+    gap = energies[mult_a] - energies[mult_b]
+    record = {
+        "index": idx,
+        "lambda": lam,
+        "geometry": geom_i,
+        "geometry_file": local_xyz,
+        "local_geometry_file": local_xyz,
+        "energies_Eh": energies,
+        "gap_Eh": gap,
+        "gap_abs_Eh": abs(gap),
+        "gap_cm1": gap * hartree_to_cm,
+        "gap_abs_cm1": abs(gap * hartree_to_cm),
+        "gap_kcal": gap * hartree_to_kcal
+    }
+
+    interp_records.append(record)
+    interp_records = sorted(interp_records, key=lambda r: r["index"])
+
+    print(f"Interpolation point {idx:03d}/{n_interp}")
+    print(f"  lambda                         = {lam:.6f}")
+    print(f"  E(mult {mult_a})                = {energies[mult_a]:.12f} Eh")
+    print(f"  E(mult {mult_b})                = {energies[mult_b]:.12f} Eh")
+    print(f"  signed gap E{mult_a}-E{mult_b}  = {record['gap_cm1']:.3f} cm^-1")
+    print(f"  absolute gap                   = {record['gap_abs_cm1']:.3f} cm^-1\n")
+
+best_record = min(interp_records, key=lambda r: r["gap_abs_Eh"])
+MECP_start_geometry = best_record["geometry"]
+
+section("BEST INTERPOLATED MECP STARTING GEOMETRY")
+print(f"Best interpolation index             : {best_record['index']}")
+print(f"Best lambda                          : {best_record['lambda']:.8f}")
+print(f"Absolute spin-state gap              : {best_record['gap_abs_cm1']:.6f} cm^-1")
+print("\nMECP starting geometry:\n")
+print(MECP_start_geometry)
+
+scan_summary_file = os.path.join(local_interp, "interpolation_scan_summary.txt")
+with open(scan_summary_file, "w", encoding="utf-8", newline="\n") as f:
+    f.write("Linear Cartesian interpolation scan\n")
+    f.write(f"jobname = {jobname}\n")
+    f.write(f"charge = {charge}\n")
+    f.write(f"multiplicities = {multiplicities}\n")
+    f.write(f"method = {method}\n")
+    f.write(f"basis = {basis}\n")
+    f.write(f"n_interp = {n_interp}\n\n")
+    f.write("index  lambda      E_mult_a_Eh        E_mult_b_Eh        gap_cm1        abs_gap_cm1      gap_kcal\n")
+    for r in interp_records:
+        f.write(
+            f"{r['index']:5d}  {r['lambda']:10.6f}  "
+            f"{r['energies_Eh'][mult_a]:18.12f}  {r['energies_Eh'][mult_b]:18.12f}  "
+            f"{r['gap_cm1']:14.6f}  {r['gap_abs_cm1']:14.6f}  {r['gap_kcal']:14.6f}\n"
+        )
+
+# ============================================================
+# Interpolation energy plot
+# ============================================================
+
+section("INTERPOLATION ENERGY PLOT")
+
+interp_records = sorted(interp_records, key=lambda r: r["index"])
+interpolation_indices = np.array([r["index"] for r in interp_records], dtype=int)
+
+low_spin_interp_mult = min(multiplicities)
+high_spin_interp_mult = max(multiplicities)
+
+low_spin_energies_Eh = np.array(
+    [r["energies_Eh"][low_spin_interp_mult] for r in interp_records],
+    dtype=float
+)
+
+high_spin_energies_Eh = np.array(
+    [r["energies_Eh"][high_spin_interp_mult] for r in interp_records],
+    dtype=float
+)
+
+# Use one common electronic-energy reference for both spin surfaces.
+interpolation_reference_Eh = float(
+    min(np.min(low_spin_energies_Eh), np.min(high_spin_energies_Eh))
+)
+
+low_spin_relative_kcal = (
+    low_spin_energies_Eh - interpolation_reference_Eh
+) * hartree_to_kcal
+
+high_spin_relative_kcal = (
+    high_spin_energies_Eh - interpolation_reference_Eh
+) * hartree_to_kcal
+
+interpolation_plot_png = os.path.join(
+    local_interp,
+    "interpolation_energy_scan.png"
+)
+
+interpolation_plot_pdf = os.path.join(
+    local_interp,
+    "interpolation_energy_scan.pdf"
+)
+
+plt.figure(figsize=(7.2, 4.8))
+plt.plot(
+    interpolation_indices,
+    low_spin_relative_kcal,
+    marker="o",
+    linewidth=2.0,
+    markersize=5,
+    label="Low spin"
+)
+plt.plot(
+    interpolation_indices,
+    high_spin_relative_kcal,
+    marker="o",
+    linewidth=2.0,
+    markersize=5,
+    label="High spin"
+)
+plt.xlabel("Interpolation geometry", fontsize=12)
+plt.ylabel("Energy (kcal/mol)", fontsize=12)
+plt.xticks(interpolation_indices, interpolation_indices)
+plt.legend(frameon=False)
+plt.tight_layout()
+plt.savefig(interpolation_plot_png, dpi=600, bbox_inches="tight")
+plt.savefig(interpolation_plot_pdf, bbox_inches="tight")
+plt.show()
+plt.close()
+
+print(f"Low-spin multiplicity             = {low_spin_interp_mult}")
+print(f"High-spin multiplicity            = {high_spin_interp_mult}")
+print(f"Interpolation reference energy    = {interpolation_reference_Eh:.12f} Eh")
+print(f"Interpolation plot PNG            = {interpolation_plot_png}")
+print(f"Interpolation plot PDF            = {interpolation_plot_pdf}")
+
+best_start_file = os.path.join(local_interp, f"{jobname}_best_MECP_crossing_guess.xyz")
+sym_best, _ = parse_geometry_to_arrays(MECP_start_geometry)
+write_text(
+    best_start_file,
+    f"{len(sym_best)}\nBest interpolated MECP guess: index={best_record['index']}, lambda={best_record['lambda']:.8f}\n{MECP_start_geometry}\n"
+)
+
+remote_scan_summary_file = scan_summary_file
+remote_best_start_file = best_start_file
+
+# ============================================================
+# MECP
+# ============================================================
+
+section("MECP OPTIMIZATION")
+
+mult_main = reference_multiplicity
+mult_other = other_multiplicity
+mecp_jobname = jobname
+
+mecp_inp = ORCA_INPUT_TEMPLATES["mecp"].format(
+    method=method,
+    basis=basis,
+    charge=charge,
+    mult=mult_main,
+    mult_other=mult_other,
+    geom=MECP_start_geometry,
+    nprocs=nprocs,
+    maxcore_mb=maxcore_mb
+)
+
+mecp_inp = apply_dft_settings_to_input(
+    mecp_inp,
+    "mecp",
+    job_specific_blocks=f"%mecp Mult {mult_other}\nend"
+)
+
+status, final_mecp_inp = submit_and_monitor_orca_job(
+    local_mecp,
+    mecp_jobname,
+    mecp_inp,
+    "MECP SurfCrossOpt",
+    True,
+    repair_policy="mecp_restricted",
+    locked={
+        "method": method,
+        "basis": basis,
+        "charge": charge,
+        "mult": mult_main,
+        "mecp_mult": mult_other,
+        "geom": MECP_start_geometry,
+    }
+)
+
+if status != "OK":
+    raise SystemExit("MECP optimization did not complete successfully.")
+
+mecp_xyz = os.path.join(local_mecp, f"{mecp_jobname}.xyz")
+if not file_exists(mecp_xyz):
+    xyz_candidates = sorted(Path(local_mecp).glob("*.xyz"))
+    if not xyz_candidates:
+        raise RuntimeError("No MECP XYZ file was found after the MECP optimization.")
+    mecp_xyz = str(xyz_candidates[0])
+
+MECP_geometry = extract_geometry_from_xyz_text(read_text(mecp_xyz), mecp_xyz)
+
+section("EXTRACTED MECP GEOMETRY")
+print(MECP_geometry)
+
+# ============================================================
+# Save metadata
+# ============================================================
+
+section("SAVING STEP 1 OUTPUTS")
+
+paths_text = {
+    os.path.join(local_mecp, "MECP_geometry.txt"):
+        MECP_geometry + "\n",
+    os.path.join(local_base, "Reference_geometry.txt"):
+        Reference_geometry + "\n",
+    os.path.join(local_mecp, "MECP_start_interpolated_geometry.txt"):
+        MECP_start_geometry + "\n",
+    os.path.join(local_mecp, f"{jobname}_final_MECP_input.inp"):
+        final_mecp_inp,
+}
+
+local_orca_templates_file = os.path.join(local_base, "step1_orca_input_templates.txt")
+paths_text[local_orca_templates_file] = (
+    "[reviewed_dft_pre_xyz]\n"
+    + globals().get("DFT_REVIEWED_PRE_XYZ", "")
+    + "\n[transfer_blocks_all]\n"
+    + globals().get("ORCA_TRANSFER_BLOCKS_ALL", "")
+    + "\n[transfer_blocks_no_output]\n"
+    + globals().get("ORCA_TRANSFER_BLOCKS_NO_OUTPUT", "")
+    + "\n[minimum]\n" + ORCA_INPUT_TEMPLATES["minimum"] +
+    "\n[single_point]\n" + ORCA_INPUT_TEMPLATES["single_point"] +
+    "\n[mecp]\n" + ORCA_INPUT_TEMPLATES["mecp"]
+)
+
+local_ref_info_file = os.path.join(local_base, "Reference_info.txt")
+ref_lines = [
+    "Reference/reactant information",
+    "Run mode = LOCAL",
+    f"Reference source = {Reference_source}",
+    f"Reference multiplicity = {Reference_multiplicity}",
+    f"Charge = {charge}",
+    f"MECP input mult_main = {mult_main}",
+    f"MECP other mult_other = {mult_other}",
+    f"Best interpolation index = {best_record['index']}",
+    f"Best interpolation lambda = {best_record['lambda']:.8f}",
+    f"Best interpolation abs gap cm-1 = {best_record['gap_abs_cm1']:.8f}",
+    f"ORCA executable = {ORCA_EXE}",
+    f"ORCA directory = {ORCA_DIR}",
+    f"ORCA input template source = {ORCA_INPUT_TEMPLATE_SOURCE}",
+    ""
+]
+
+for mult in multiplicities:
+    dEh = minima_data[mult]["E_plus_ZPE_Eh"] - E0
+    ref_lines += [
+        f"[Multiplicity {mult}]",
+        f"spin_name = {minima_data[mult]['spin_name']}",
+        f"Electronic_Eh = {minima_data[mult]['Electronic_Eh']:.12f}",
+        f"ZPE_Eh = {minima_data[mult]['ZPE_Eh']:.12f}",
+        f"E_plus_ZPE_Eh = {minima_data[mult]['E_plus_ZPE_Eh']:.12f}",
+        f"Relative_cm1 = {dEh * hartree_to_cm:.6f}",
+        f"Relative_kcal = {dEh * hartree_to_kcal:.6f}",
+        f"out_path = {minima_data[mult]['out_path']}",
+        f"xyz_path = {minima_data[mult]['xyz_path']}",
+        ""
+    ]
+
+paths_text[local_ref_info_file] = "\n".join(ref_lines) + "\n"
+
+for path, text in paths_text.items():
+    write_text(path, text)
+
+# Backward-compatible variables for later steps
+reference_source = Reference_source
+reference_multiplicity = Reference_multiplicity
+use_initial_ref = False
+casscf_block = ""
+
+# Cluster-specific names intentionally removed/disabled in local mode.
+CLUSTER_SH_TEMPLATE = ""
+CLUSTER_SH_TEMPLATE_WAS_REVIEWED = False
+CLUSTER_SH_TEMPLATE_SOURCE = "Disabled in Local PC Step 1"
+CLUSTER_SUBMIT_COMMAND_PREFIX = ""
+CLUSTER_SUBMIT_COMMAND_TEMPLATE = ""
+CLUSTER_SUBMIT_COMMAND_TEMPLATE_WAS_REVIEWED = False
+CLUSTER_SUBMIT_COMMAND_TEMPLATE_SOURCE = "Disabled in Local PC Step 1"
+
+# Compatibility placeholders: no SSH/SFTP objects exist in the local workflow.
+ssh = None
+sftp = None
+cluster_host = None
+cluster_account = None
+
+# ============================================================
+# Final summary
+# ============================================================
+
+section("STEP 1 SUMMARY")
+print(f"RUN_MODE                      = {RUN_MODE}")
+print(f"workflow_mode                 = {workflow_mode}")
+print(f"run_mecp_optimization         = {run_mecp_optimization}")
+print(f"jobname                       = {jobname}")
+print(f"charge                        = {charge}")
+print("\nSpin-state summary:")
+print(f"  requested multiplicities    = {multiplicities}")
+print(f"  mult_main for MECP          = {mult_main}")
+print(f"  mult_other for MECP         = {mult_other}")
+print(f"  Reference_multiplicity      = {Reference_multiplicity}")
+print("\nInterpolation scan:")
+print(f"  n_interp                    = {n_interp}")
+print(f"  best index                  = {best_record['index']}")
+print(f"  best lambda                 = {best_record['lambda']:.8f}")
+print(f"  best absolute gap           = {best_record['gap_abs_cm1']:.6f} cm^-1")
+print(f"  local scan summary          = {scan_summary_file}")
+print(f"  interpolation plot PNG      = {interpolation_plot_png}")
+print(f"  interpolation plot PDF      = {interpolation_plot_pdf}")
+print("\nMethod and resources:")
+print(f"  method                      = {method}")
+print(f"  basis                       = {basis}")
+print(f"  nprocs                      = {nprocs}")
+print(f"  maxcore_mb per core         = {maxcore_mb}")
+print(f"  approximate total memory    = {nprocs * mem_gb} GB")
+print(f"  ORCA executable             = {ORCA_EXE}")
+print(f"  ORCA directory              = {ORCA_DIR}")
+print(f"  Microsoft MPI available     = {MPI_AVAILABLE}")
+print(f"  Microsoft MPI directory     = {MPI_DIR}")
+print("\nTemplate status:")
+print(f"  ORCA inputs reviewed        = {ORCA_INPUT_TEMPLATES_WERE_REVIEWED}")
+print(f"  ORCA input source           = {ORCA_INPUT_TEMPLATE_SOURCE}")
+print("\nLocal directories:")
+print(f"  local_base                  = {local_base}")
+print(f"  local_minima                = {local_minima}")
+print(f"  local_interp                = {local_interp}")
+print(f"  local_mecp                  = {local_mecp}")
+print("\nPrepared geometries:")
+print("  Initial_geometry")
+print("  Reference_geometry")
+print("  MECP_start_geometry")
+print("  MECP_geometry")
+print("\nVariables available for later steps:")
+print("  RUN_MODE, workflow_mode, run_mecp_optimization")
+print("  jobname, charge, multiplicities, mult_main, mult_other")
+print("  Reference_multiplicity, reference_multiplicity")
+print("  Reference_source, reference_source")
+print("  Initial_geometry, Reference_geometry, MECP_start_geometry, MECP_geometry")
+print("  method, basis, nprocs, mem_gb, maxcore_mb")
+print("  ORCA_EXE, ORCA_DIR, MPI_AVAILABLE, MPI_DIR")
+print("  local_base, local_minima, local_interp, local_mecp")
+print("  remote_base, remote_minima, remote_interp, remote_mecp  # local aliases")
+print("  minima_data, interp_records, best_record")
+print("  interpolation_plot_png, interpolation_plot_pdf")
+print("  low_spin_relative_kcal, high_spin_relative_kcal")
+print("  ORCA_INPUT_TEMPLATES, ORCA_INPUT_TEMPLATES_WERE_REVIEWED, ORCA_INPUT_TEMPLATE_SOURCE")
+print("  submit_and_monitor_orca_job, submit_orca_job_no_monitor, monitor_submitted_orca_jobs")
+print("\nSTEP 1 COMPLETED SUCCESSFULLY.\n")
+print("\nGeometry of the optimized minimum-energy crossing point (MECP):\n")
+print(MECP_geometry)
+
+#%% STEP 2. Local PC ROHF + ORCA_LOC + AUTOMATIC CASSCF/CASCI SOC AT MECP
+
+import os
+import re
+import subprocess
+from pathlib import Path
+import numpy as np
+
+print(r'''
+====================================================================
+ STEP 2 | LOCAL PC VERSION
+ ROHF + UHF/UNO orbital preparation, active-space analysis, and SOC
+====================================================================
+
+This is the Local PC version of Step 2.
+
+No SSH, no SFTP, no PBS/qsub, and no bash submission file are used.
+This step reuses the local Step 1 outputs and runs ORCA directly on
+this machine through the local submit_and_monitor_orca_job() function
+created in Step 1.
+
+This step uses the MECP geometry from Step 1. A high-spin ROHF
+calculation and a high-spin UHF/UNO calculation are performed first.
+The ROHF output is parsed for singly occupied molecular orbitals, while
+the UHF/UNO output is parsed for natural-orbital occupations. The user
+then chooses whether the generated SOC input should use ROHF or UHF/UNO
+active-space information. The generated SOC input is fully editable.
+
+The scalar SOC is evaluated as
+
+  H_SO = sqrt( sum_{Ms,Ms'} |<S,Ms|H_SO|S',Ms'>|^2 )
+
+''')
+
+# ============================================================
+# Required variables from Local PC Step 1
+# ============================================================
+
+required_vars_step2 = [
+    "jobname", "MECP_geometry", "charge", "mult_main", "mult_other",
+    "multiplicities", "basis", "nprocs", "mem_gb", "maxcore_mb",
+    "local_base", "local_mecp", "ORCA_EXE", "ORCA_DIR",
+    "submit_and_monitor_orca_job"
+]
+
+for var in required_vars_step2:
+    if var not in globals():
+        raise RuntimeError(f"Required variable '{var}' is missing. Run Local PC Step 1 first.")
+
+workflow_mode = "MECP_ONLY"
+RUN_MODE = globals().get("RUN_MODE", "LOCAL")
+
+# Backward-compatible aliases. In Local PC mode these are local paths.
+if "remote_base" not in globals():
+    remote_base = local_base
+if "remote_mecp" not in globals():
+    remote_mecp = local_mecp
+
+# Cluster-specific objects are intentionally unused in local mode.
+ssh = globals().get("ssh", None)
+sftp = globals().get("sftp", None)
+CLUSTER_SH_TEMPLATE = globals().get("CLUSTER_SH_TEMPLATE", "")
+CLUSTER_SH_TEMPLATE_WAS_REVIEWED = False
+CLUSTER_SH_TEMPLATE_SOURCE = "Disabled in Local PC Step 2"
+CLUSTER_SUBMIT_COMMAND_PREFIX = globals().get("CLUSTER_SUBMIT_COMMAND_PREFIX", "")
+CLUSTER_SUBMIT_COMMAND_TEMPLATE = globals().get("CLUSTER_SUBMIT_COMMAND_TEMPLATE", "")
+CLUSTER_SUBMIT_COMMAND_TEMPLATE_WAS_REVIEWED = False
+CLUSTER_SUBMIT_COMMAND_TEMPLATE_SOURCE = "Disabled in Local PC Step 2"
+
+# ============================================================
+# User-interface helpers
+# ============================================================
+
+def safe_input(prompt=""):
+    return input(prompt)
+
+
+def section(title):
+    print("\n" + "=" * 72)
+    print(f" {title}")
+    print("=" * 72 + "\n")
+
+
+def subsection(title):
+    print("\n" + "-" * 72)
+    print(title)
+    print("-" * 72 + "\n")
+
+
+def ask_yes_no(prompt, default=None):
+    if default is True:
+        suffix = " (Y/N, default Y): "
+    elif default is False:
+        suffix = " (Y/N, default N): "
+    else:
+        suffix = " (Y/N): "
+
+    while True:
+        ans = safe_input(prompt + suffix).strip().lower()
+        if ans == "" and default is not None:
+            return bool(default)
+        if ans in ("y", "yes"):
+            return True
+        if ans in ("n", "no"):
+            return False
+        print("  Please answer Y or N.")
+
+
+def ask_float(prompt, default=None, minimum=None):
+    while True:
+        ans = safe_input(prompt).strip()
+        if ans == "" and default is not None:
+            return float(default)
+        try:
+            val = float(ans)
+            if minimum is not None and val < minimum:
+                print(f"  Input must be at least {minimum}.")
+                continue
+            return val
+        except ValueError:
+            print("  Please enter a numerical value.")
+
+
+def write_local_text(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+def read_local_text_file(local_path):
+    with open(local_path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+
+def local_file_exists(path):
+    return os.path.isfile(path)
+
+
+def local_text_status(local_dir, basename):
+    local_out = os.path.join(local_dir, f"{basename}.out")
+    if not os.path.isfile(local_out):
+        return "MISSING"
+    txt = read_local_text_file(local_out)
+    low = txt.lower()
+    if "orca terminated normally" in low:
+        return "OK"
+    if "error termination" in low or "orca finished by error termination" in low:
+        return "ERROR"
+    return "FAILED"
+
+
+# Backward-compatible names used below. In Local PC mode, "remote" paths are local paths.
+read_remote_text_file = read_local_text_file
+remote_text_status = local_text_status
+
+def remote_file_exists(_unused_sftp, path):
+    return os.path.isfile(path)
+
+
+def edit_text_block_if_requested(title, text):
+    print(f"\n================ GENERATED {title} ================\n")
+    print(text)
+    print("====================================================\n")
+
+    if not ask_yes_no(f"Edit {title} before local ORCA run?", default=False):
+        return text
+
+    print("\nPaste the full modified text below.")
+    print("Finish with a line containing only EOF.\n")
+
+    lines = []
+    while True:
+        line = safe_input()
+        if line.strip() == "EOF":
+            break
+        lines.append(line)
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def spin_S_from_multiplicity(mult):
+    return 0.5 * (int(mult) - 1)
+
+
+def multiplicity_name(mult):
+    return {
+        1: "singlet", 2: "doublet", 3: "triplet", 4: "quartet", 5: "quintet",
+        6: "sextet", 7: "septet", 8: "octet", 9: "nonet", 10: "decet"
+    }.get(int(mult), f"mult{mult}")
+
+
+
+# ============================================================
+# Step 2 ORCA block propagation from Step 1
+# ============================================================
+
+def _default_step2_orbital_blocks(include_output=True, uno_output=False):
+    text = f"""%pal nprocs {nprocs} end
+%maxcore {maxcore_mb}
+
+%scf
+  MaxIter 1500
+  SOSCFStart 0.01
+  LevelShift 0.5
+end
+
+"""
+    if include_output:
+        if uno_output:
+            text += """%output
+  Print[P_UNO_OccNum] 1
+  Print[P_UNO_AtPopMO_M] 1
+end
+
+"""
+        else:
+            text += """%output
+  PrintLevel 3
+end
+
+"""
+    return text
+
+
+def step2_transfer_blocks(exclude_output=False):
+    """Transfer user-added % blocks from Step 1 to ROHF/UHF/SOC inputs.
+
+    For SOC, call with exclude_output=True so the SOC-specific %output block
+    is always kept fixed and cannot be replaced by a Step 1 %output block.
+    """
+    if exclude_output:
+        blocks = globals().get("ORCA_TRANSFER_BLOCKS_NO_OUTPUT", "")
+    else:
+        blocks = globals().get("ORCA_TRANSFER_BLOCKS_ALL", "")
+
+    if blocks and blocks.strip():
+        return blocks.rstrip() + "\n\n"
+
+    return _default_step2_orbital_blocks(include_output=(not exclude_output))
+
+
+def step2_required_uno_output_block():
+    return """%output
+  Print[P_UNO_OccNum] 1
+  Print[P_UNO_AtPopMO_M] 1
+end
+
+"""
+
+
+def step2_fixed_soc_output_block():
+    return """%output
+  PrintLevel 3
+end
+
+"""
+
+# ============================================================
+# Periodic table and geometry helpers
+# ============================================================
+
+ATOMIC_NUMBERS = {
+    "H": 1, "He": 2,
+    "Li": 3, "Be": 4, "B": 5, "C": 6, "N": 7, "O": 8, "F": 9, "Ne": 10,
+    "Na": 11, "Mg": 12, "Al": 13, "Si": 14, "P": 15, "S": 16, "Cl": 17, "Ar": 18,
+    "K": 19, "Ca": 20, "Sc": 21, "Ti": 22, "V": 23, "Cr": 24, "Mn": 25, "Fe": 26,
+    "Co": 27, "Ni": 28, "Cu": 29, "Zn": 30, "Ga": 31, "Ge": 32, "As": 33, "Se": 34,
+    "Br": 35, "Kr": 36, "Rb": 37, "Sr": 38, "Y": 39, "Zr": 40, "Nb": 41, "Mo": 42,
+    "Tc": 43, "Ru": 44, "Rh": 45, "Pd": 46, "Ag": 47, "Cd": 48, "In": 49, "Sn": 50,
+    "Sb": 51, "Te": 52, "I": 53, "Xe": 54, "Cs": 55, "Ba": 56, "La": 57, "Ce": 58,
+    "Pr": 59, "Nd": 60, "Pm": 61, "Sm": 62, "Eu": 63, "Gd": 64, "Tb": 65, "Dy": 66,
+    "Ho": 67, "Er": 68, "Tm": 69, "Yb": 70, "Lu": 71, "Hf": 72, "Ta": 73, "W": 74,
+    "Re": 75, "Os": 76, "Ir": 77, "Pt": 78, "Au": 79, "Hg": 80, "Tl": 81, "Pb": 82,
+    "Bi": 83, "Po": 84, "At": 85, "Rn": 86
+}
+
+TRANSITION_METALS = {
+    "Sc", "Ti", "V", "Cr", "Mn", "Fe", "Co", "Ni", "Cu", "Zn",
+    "Y", "Zr", "Nb", "Mo", "Tc", "Ru", "Rh", "Pd", "Ag", "Cd",
+    "Hf", "Ta", "W", "Re", "Os", "Ir", "Pt", "Au", "Hg"
+}
+
+
+def parse_geometry_symbols(geom_text):
+    symbols = []
+    for line in geom_text.splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            sym = re.sub(r"[^A-Za-z]", "", parts[0])
+            sym = sym[0].upper() + sym[1:].lower()
+            symbols.append(sym)
+    if not symbols:
+        raise RuntimeError("Could not parse atom symbols from MECP_geometry.")
+    return symbols
+
+
+def infer_metal_symbol_from_geometry(geom_text):
+    metals = [sym for sym in parse_geometry_symbols(geom_text) if sym in TRANSITION_METALS]
+    if not metals:
+        raise RuntimeError("No transition-metal atom was detected in MECP_geometry.")
+    if len(set(metals)) > 1:
+        print("Multiple transition-metal symbols were detected:")
+        print(f"  {sorted(set(metals))}")
+        print("The first transition-metal symbol in the geometry will be used for SOMO localization analysis.")
+    return metals[0]
+
+
+def total_electrons_from_geometry_and_charge(geom_text, molecular_charge):
+    z_sum = 0
+    missing = []
+    for sym in parse_geometry_symbols(geom_text):
+        if sym not in ATOMIC_NUMBERS:
+            missing.append(sym)
+        else:
+            z_sum += ATOMIC_NUMBERS[sym]
+    if missing:
+        raise RuntimeError(f"Missing atomic numbers for: {sorted(set(missing))}")
+    return int(z_sum - molecular_charge)
+
+# ============================================================
+# ROHF SOMO parsing
+# ============================================================
+
+def parse_singly_occupied_orbitals_from_rohf_out(out_text, occ_target=1.0, tol=1.0e-4):
+    marker = "ORBITAL ENERGIES"
+    if marker not in out_text:
+        raise RuntimeError("Could not find the ORBITAL ENERGIES section in the ROHF output.")
+
+    section_text = out_text.split(marker, 1)[1]
+    somo_indices = []
+    orbital_rows = []
+
+    for raw in section_text.splitlines():
+        parts = raw.split()
+        if len(parts) >= 4:
+            try:
+                mo_index = int(parts[0])
+                occ = float(parts[1])
+                energy_eh = float(parts[2])
+                energy_ev = float(parts[3])
+                orbital_rows.append((mo_index, occ, energy_eh, energy_ev))
+                if abs(occ - occ_target) <= tol:
+                    somo_indices.append(mo_index)
+            except ValueError:
+                if orbital_rows:
+                    break
+        elif orbital_rows:
+            break
+
+    if not orbital_rows:
+        raise RuntimeError("The ORBITAL ENERGIES section was found, but no orbital rows were parsed.")
+    if not somo_indices:
+        raise RuntimeError("No singly occupied orbitals with OCC approximately equal to 1.0000 were found.")
+    return somo_indices, orbital_rows
+
+
+def parse_uno_occupations_from_uhf_out(out_text):
+    """Parse ORCA's UHF NATURAL ORBITALS occupation-number list.
+
+    Returns a sorted list of (orbital_index, occupation). ORCA prints natural
+    orbital indices as N[  i] with occupations between 0 and 2.
+    """
+    marker = "UHF NATURAL ORBITALS"
+    if marker not in out_text:
+        raise RuntimeError("Could not find the UHF NATURAL ORBITALS section in the UHF/UNO output.")
+
+    section_text = out_text.split(marker, 1)[1]
+    matches = re.findall(
+        r"N\[\s*(\d+)\s*\]\s*=\s*([-+]?\d*\.\d+(?:[Ee][-+]?\d+)?)",
+        section_text
+    )
+
+    if not matches:
+        raise RuntimeError("UHF NATURAL ORBITALS was found, but no N[i] occupation values were parsed.")
+
+    occupations = [(int(i), float(occ)) for i, occ in matches]
+    occupations.sort(key=lambda x: x[0])
+    return occupations
+
+
+def select_uno_active_orbitals(uno_occupations, low=0.02, high=1.98, somo_tol=1.0e-4):
+    active = [(idx, occ) for idx, occ in uno_occupations if occ > low and occ < high]
+    somos = [(idx, occ) for idx, occ in uno_occupations if abs(occ - 1.0) <= somo_tol]
+
+    active_indices = [idx for idx, occ in active]
+    active_electrons = int(round(sum(occ for idx, occ in active)))
+    active_orbitals = len(active_indices)
+
+    return {
+        "active": active,
+        "somos": somos,
+        "active_indices": active_indices,
+        "active_electrons": active_electrons,
+        "active_orbitals": active_orbitals,
+        "low": low,
+        "high": high,
+        "somo_tol": somo_tol,
+    }
+
+# ============================================================
+# orca_loc helpers
+# ============================================================
+
+def detect_orca_loc_command():
+    """Return the local orca_loc executable path."""
+    orca_dir = Path(str(ORCA_DIR))
+
+    candidates = []
+    if os.name == "nt":
+        candidates.extend([
+            orca_dir / "orca_loc.exe",
+            orca_dir / "orca_loc.bat",
+            orca_dir / "orca_loc",
+        ])
+    else:
+        candidates.extend([
+            orca_dir / "orca_loc",
+            orca_dir / "orca_loc.exe",
+        ])
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return str(candidate.resolve())
+
+    raise RuntimeError(
+        "Could not find local orca_loc in the ORCA directory.\n"
+        f"ORCA_DIR = {ORCA_DIR}\n"
+        "Expected orca_loc.exe on Windows or orca_loc on Linux/macOS."
+    )
+
+
+def build_locinp_text(gbw_filename, loc_filename, first_somo, last_somo):
+    return f"""{gbw_filename}
+{loc_filename}
+{int(first_somo)}
+{int(last_somo)}
+1
+"""
+
+
+def run_orca_loc(local_dir, locinp_filename):
+    orca_loc_command = detect_orca_loc_command()
+    loc_stdout_filename = locinp_filename.rsplit(".", 1)[0] + ".orca_loc.out"
+    local_dir = Path(local_dir)
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    env = os.environ.copy()
+    path_parts = [str(ORCA_DIR)]
+    if globals().get("MPI_AVAILABLE", False) and globals().get("MPI_DIR", None):
+        path_parts.append(str(MPI_DIR))
+    path_parts.append(env.get("PATH", ""))
+    env["PATH"] = os.pathsep.join(path_parts)
+
+    stdout_path = local_dir / loc_stdout_filename
+
+    section("RUNNING LOCAL ORCA_LOC")
+    print(f"Local directory  : {local_dir}")
+    print(f"orca_loc command : {orca_loc_command}")
+    print(f"Input file       : {locinp_filename}")
+    print(f"Output capture   : {loc_stdout_filename}")
+
+    with open(stdout_path, "w", encoding="utf-8", newline="\n") as out_handle:
+        result = subprocess.run(
+            [orca_loc_command, locinp_filename],
+            cwd=str(local_dir),
+            stdout=out_handle,
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True
+        )
+
+    if not stdout_path.exists():
+        raise RuntimeError(f"orca_loc output capture was not created:\n{stdout_path}")
+
+    if result.returncode != 0:
+        print(f"WARNING: orca_loc returned nonzero exit code: {result.returncode}")
+
+    return read_local_text_file(stdout_path), str(stdout_path), orca_loc_command
+
+
+def parse_lmo_compositions_from_orca_loc_output(loc_output_text, somo_indices):
+    somo_set = {int(x) for x in somo_indices}
+    records = {}
+    line_pattern = re.compile(r"MO\s+(\d+):(.+)")
+    atom_pattern = re.compile(r"(\d+)([A-Za-z]+)\s*-\s*([+-]?\d+\.\d+)")
+
+    for raw in loc_output_text.splitlines():
+        m = line_pattern.search(raw)
+        if not m:
+            continue
+        mo_index = int(m.group(1))
+        if mo_index not in somo_set:
+            continue
+        contributions = []
+        for am in atom_pattern.finditer(m.group(2)):
+            contributions.append({
+                "atom_index": int(am.group(1)),
+                "atom_symbol": am.group(2),
+                "population": float(am.group(3))
+            })
+        if contributions:
+            records[mo_index] = contributions
+
+    missing = sorted(somo_set - set(records))
+    if missing:
+        raise RuntimeError(
+            "The orca_loc output did not contain localized-orbital composition records "
+            f"for SOMOs: {missing}"
+        )
+    return records
+
+
+def choose_soc_protocol_from_lmo_records(lmo_records, metal_symbol, metal_population_threshold=0.93):
+    diagnostics = []
+    all_somos_metal_centered = True
+
+    for mo_index in sorted(lmo_records):
+        contributions = lmo_records[mo_index]
+        metal_population = sum(
+            item["population"] for item in contributions
+            if item["atom_symbol"].lower() == metal_symbol.lower()
+        )
+        dominant = max(contributions, key=lambda x: x["population"])
+        metal_is_dominant = dominant["atom_symbol"].lower() == metal_symbol.lower()
+        passes_threshold = metal_population >= metal_population_threshold
+
+        diagnostics.append({
+            "mo_index": mo_index,
+            "metal_population": metal_population,
+            "dominant_atom_index": dominant["atom_index"],
+            "dominant_atom_symbol": dominant["atom_symbol"],
+            "dominant_population": dominant["population"],
+            "metal_is_dominant": metal_is_dominant,
+            "passes_threshold": passes_threshold
+        })
+
+        if (not metal_is_dominant) or (not passes_threshold):
+            all_somos_metal_centered = False
+
+    if all_somos_metal_centered:
+        return (
+            "MRCI",
+            "All localized SOMOs are metal-dominated and pass the metal-population threshold.",
+            diagnostics
+        )
+
+    return (
+        "CASCI_CASSCF_MAXITER_1",
+        "At least one localized SOMO has substantial ligand character or metal population below threshold.",
+        diagnostics
+    )
+
+# ============================================================
+# SOC parsing and definitions
+# ============================================================
+
+def parse_orca_soc_matrix_elements(soc_output_text):
+    marker = "NONZERO SOC MATRIX ELEMENTS (cm**-1)"
+    if marker not in soc_output_text:
+        raise RuntimeError("Could not find NONZERO SOC MATRIX ELEMENTS (cm**-1) in the SOC output.")
+
+    soc_section = soc_output_text.split(marker, 1)[1]
+    values = []
+
+    for raw in soc_section.splitlines():
+        stripped = raw.strip()
+        if "Note:" in stripped:
+            break
+        if not stripped:
+            continue
+        parts = stripped.split()
+        if len(parts) < 10:
+            continue
+        try:
+            bra_block = int(parts[0])
+            bra_root = int(parts[1])
+            bra_S = float(parts[2])
+            bra_Ms = float(parts[3])
+            ket_block = int(parts[4])
+            ket_root = int(parts[5])
+            ket_S = float(parts[6])
+            ket_Ms = float(parts[7])
+            real_part = float(parts[-2])
+            imag_part = float(parts[-1])
+        except ValueError:
+            continue
+
+        values.append({
+            "bra_block": bra_block,
+            "bra_root": bra_root,
+            "bra_S": bra_S,
+            "bra_Ms": bra_Ms,
+            "ket_block": ket_block,
+            "ket_root": ket_root,
+            "ket_S": ket_S,
+            "ket_Ms": ket_Ms,
+            "real": real_part,
+            "imag": imag_part,
+            "complex": complex(real_part, imag_part),
+            "abs_cm1": float(np.sqrt(real_part**2 + imag_part**2)),
+            "sq_cm2": float(real_part**2 + imag_part**2),
+            "intermultiplicity": abs(bra_S - ket_S) > 1.0e-8,
+            "line": stripped
+        })
+    return values
+
+
+def build_ms_resolved_soc_matrix(soc_values, mult_a, mult_b):
+    S_a = spin_S_from_multiplicity(mult_a)
+    S_b = spin_S_from_multiplicity(mult_b)
+    S_low = min(S_a, S_b)
+    S_high = max(S_a, S_b)
+    Ms_low = np.arange(S_low, -S_low - 1, -1, dtype=float)
+    Ms_high = np.arange(S_high, -S_high - 1, -1, dtype=float)
+    matrix = np.zeros((len(Ms_low), len(Ms_high)), dtype=complex)
+
+    for item in [x for x in soc_values if x["intermultiplicity"]]:
+        value = item["complex"]
+        if abs(item["bra_S"] - S_low) < 1.0e-8 and abs(item["ket_S"] - S_high) < 1.0e-8:
+            i = int(np.where(np.isclose(Ms_low, item["bra_Ms"]))[0][0])
+            j = int(np.where(np.isclose(Ms_high, item["ket_Ms"]))[0][0])
+            matrix[i, j] = value
+        elif abs(item["bra_S"] - S_high) < 1.0e-8 and abs(item["ket_S"] - S_low) < 1.0e-8:
+            i = int(np.where(np.isclose(Ms_low, item["ket_Ms"]))[0][0])
+            j = int(np.where(np.isclose(Ms_high, item["bra_Ms"]))[0][0])
+            matrix[i, j] = np.conjugate(value)
+    return S_low, S_high, Ms_low, Ms_high, matrix
+
+
+def compute_effective_soc_norm(soc_matrix):
+    """
+    Return the Frobenius norm of the complete Ms-resolved SOC matrix.
+
+    This is the square root of the sum of squared absolute values of all
+    intermultiplicity matrix elements represented in the matrix.
+    """
+    soc_matrix = np.asarray(soc_matrix, dtype=complex)
+    return float(
+        np.sqrt(
+            np.sum(
+                np.abs(soc_matrix) ** 2
+            )
+        )
+    )
+
+
+def channel_soc_dictionary(S_low, S_high, Ms_low, Ms_high, soc_matrix):
+    channels = {}
+    for i, Ms_i in enumerate(Ms_low):
+        for j, Ms_j in enumerate(Ms_high):
+            val = soc_matrix[i, j]
+            if abs(val) > 1.0e-12:
+                key = f"S{S_low:.1f}_Ms{Ms_i:+.1f}_to_S{S_high:.1f}_Ms{Ms_j:+.1f}"
+                channels[key] = val
+    return channels
+
+# ============================================================
+# Directories and filenames
+# ============================================================
+
+local_soc = os.path.join(local_base, "SOC")
+os.makedirs(local_soc, exist_ok=True)
+
+# Backward-compatible aliases. In Local PC mode, "remote" is local.
+remote_soc = local_soc
+
+orb_jobname = f"{jobname}_ROHF_HS"
+orb_inp_filename = f"{orb_jobname}.inp"
+orb_out_filename = f"{orb_jobname}.out"
+orb_gbw_filename = f"{orb_jobname}.gbw"
+
+locinp_filename = f"{orb_jobname}.locinp"
+loc_filename = f"{orb_jobname}.loc"
+
+soc_jobname = f"{jobname}_SOC"
+soc_inp_filename = f"{soc_jobname}.inp"
+soc_out_filename = f"{soc_jobname}.out"
+
+remote_orb_out = os.path.join(remote_soc, orb_out_filename)
+remote_orb_gbw = os.path.join(remote_soc, orb_gbw_filename)
+remote_locinp = os.path.join(remote_soc, locinp_filename)
+remote_loc_file = os.path.join(remote_soc, loc_filename)
+remote_soc_out = os.path.join(remote_soc, soc_out_filename)
+remote_soc_inp = os.path.join(remote_soc, soc_inp_filename)
+
+# Check SOC status early so an already completed SOC calculation does not
+# trigger the ROHF/UHF orbital-source prompt later.
+soc_status_initial = remote_text_status(remote_soc, soc_jobname)
+SOC_OUTPUT_ALREADY_COMPLETE = (soc_status_initial == "OK")
+
+section("STEP 2 DIRECTORY PREPARATION")
+print(f"Local SOC directory  : {local_soc}")
+
+# ============================================================
+# High-spin ROHF orbital preparation
+# ============================================================
+
+section("ROHF HIGH-SPIN ORBITAL PREPARATION")
+
+soc_orbital_mult = max(multiplicities)
+orbital_method = "ROHF"
+
+print(f"High-spin ROHF multiplicity : {soc_orbital_mult}")
+print("ROHF output will be parsed automatically for OCC = 1.0000 orbitals.")
+
+
+def build_rohf_hs_input():
+    blocks = step2_transfer_blocks(exclude_output=False)
+    return f"""! {orbital_method} {basis} TightSCF SlowConv
+
+{blocks}* xyz {charge} {soc_orbital_mult}
+{MECP_geometry}
+*
+"""
+
+orb_status = remote_text_status(remote_soc, orb_jobname)
+gbw_exists = remote_file_exists(sftp, remote_orb_gbw)
+
+orbital_inp_text = build_rohf_hs_input()
+
+if orb_status == "OK" and gbw_exists:
+    print(f"Completed ROHF output and GBW already exist for {orb_jobname}.")
+    print("Skipping ROHF submission. Existing ROHF output and GBW will be used.")
+
+else:
+    status, orbital_inp_text = submit_and_monitor_orca_job(
+        remote_dir=remote_soc,
+        jobname_i=orb_jobname,
+        inp_text=orbital_inp_text,
+        job_label="ROHF high-spin orbital preparation for SOC",
+        allow_interactive_repair=True,
+        repair_policy="rohf_restricted",
+        locked={
+            "method": orbital_method,
+            "basis": basis,
+            "charge": charge,
+            "mult": soc_orbital_mult,
+            "geom": MECP_geometry,
+        }
+    )
+
+    if status != "OK":
+        raise SystemExit(
+            "ROHF high-spin orbital preparation did not complete successfully."
+        )
+
+if not remote_file_exists(sftp, remote_orb_out):
+    raise RuntimeError(
+        f"ROHF output file was not found:\n{remote_orb_out}"
+    )
+
+if not remote_file_exists(sftp, remote_orb_gbw):
+    raise RuntimeError(
+        f"ROHF GBW file was not found:\n{remote_orb_gbw}"
+    )
+
+# ============================================================
+# SOMO detection
+# ============================================================
+
+section("ROHF SOMO DETECTION")
+
+rohf_out_text = read_remote_text_file(remote_orb_out)
+rohf_somo_indices, rohf_orbital_rows = parse_singly_occupied_orbitals_from_rohf_out(rohf_out_text)
+
+if sorted(rohf_somo_indices) != list(range(min(rohf_somo_indices), max(rohf_somo_indices) + 1)):
+    raise RuntimeError(
+        "Detected SOMOs are not contiguous; automatic orca_loc localization "
+        "requires a contiguous SOMO window."
+    )
+
+first_somo = min(rohf_somo_indices)
+last_somo = max(rohf_somo_indices)
+nel_soc = len(rohf_somo_indices)
+norb_soc = len(rohf_somo_indices)
+total_electrons = total_electrons_from_geometry_and_charge(MECP_geometry, charge)
+
+print(f"Total electrons from geometry and charge : {total_electrons}")
+print(f"Detected ROHF SOMOs                      : {rohf_somo_indices}")
+print(f"Standard SOC active space                : CAS({nel_soc},{norb_soc})")
+print(f"First SOMO                               : {first_somo}")
+print(f"Last SOMO                                : {last_somo}")
+
+print("\nDetected SOMO rows from the ORBITAL ENERGIES section:")
+for mo, occ, eeh, eev in rohf_orbital_rows:
+    if mo in rohf_somo_indices:
+        print(f"  MO {mo:4d}   OCC={occ:.4f}   E={eeh: .8f} Eh   {eev: .4f} eV")
+
+# ============================================================
+# UHF/UNO orbital preparation and active-space detection
+# ============================================================
+
+section("UHF/UNO ORBITAL PREPARATION")
+
+uhf_jobname = f"{jobname}_UHF_UNO_HS"
+uhf_out_filename = f"{uhf_jobname}.out"
+uhf_gbw_filename = f"{uhf_jobname}.gbw"
+uhf_uno_filename = f"{uhf_jobname}.uno"
+
+remote_uhf_out = os.path.join(remote_soc, uhf_out_filename)
+remote_uhf_gbw = os.path.join(remote_soc, uhf_gbw_filename)
+remote_uhf_uno = os.path.join(remote_soc, uhf_uno_filename)
+
+print(f"High-spin UHF/UNO multiplicity : {soc_orbital_mult}")
+print("UHF/UNO output will be parsed for natural-orbital occupations.")
+print("UNO active orbitals are selected with 0.02 < occupation < 1.98.")
+
+
+def build_uhf_uno_hs_input():
+    blocks = step2_transfer_blocks(exclude_output=True)
+    output_block = step2_required_uno_output_block()
+    return f"""! UHF {basis} TightSCF SlowConv UNO
+
+{blocks}{output_block}* xyz {charge} {soc_orbital_mult}
+{MECP_geometry}
+*
+"""
+
+uhf_uno_inp_text = build_uhf_uno_hs_input()
+uhf_status = remote_text_status(remote_soc, uhf_jobname)
+
+if uhf_status == "OK":
+    print(f"Completed UHF/UNO output already exists for {uhf_jobname}.")
+    print("Skipping UHF/UNO submission. Existing output will be used.")
+else:
+    status, uhf_uno_inp_text = submit_and_monitor_orca_job(
+        remote_dir=remote_soc,
+        jobname_i=uhf_jobname,
+        inp_text=uhf_uno_inp_text,
+        job_label="UHF/UNO high-spin orbital preparation for SOC",
+        allow_interactive_repair=True,
+        repair_policy="rohf_restricted",
+        locked={
+            "method": "UHF",
+            "basis": basis,
+            "charge": charge,
+            "mult": soc_orbital_mult,
+            "geom": MECP_geometry,
+        }
+    )
+
+    if status != "OK":
+        raise SystemExit("UHF/UNO high-spin orbital preparation did not complete successfully.")
+
+if not remote_file_exists(sftp, remote_uhf_out):
+    raise RuntimeError(f"UHF/UNO output file was not found:\n{remote_uhf_out}")
+
+uhf_out_text = read_remote_text_file(remote_uhf_out)
+uno_occupations = parse_uno_occupations_from_uhf_out(uhf_out_text)
+uno_selection = select_uno_active_orbitals(uno_occupations, low=0.02, high=1.98)
+
+uhf_uno_active_indices = uno_selection["active_indices"]
+uhf_uno_somo_indices = [idx for idx, occ in uno_selection["somos"]]
+uhf_uno_active_electrons = uno_selection["active_electrons"]
+uhf_uno_active_orbitals = uno_selection["active_orbitals"]
+
+if uhf_uno_active_orbitals <= 0 or uhf_uno_active_electrons <= 0:
+    raise RuntimeError("UNO active-space detection failed: no orbitals in the 0.02-1.98 occupation window.")
+
+print("\nUHF natural-orbital SOMO-like occupations, OCC ≈ 1.0000:")
+if uno_selection["somos"]:
+    for idx, occ in uno_selection["somos"]:
+        print(f"  UNO {idx:4d}   occupation = {occ:.5f}")
+else:
+    print("  No exactly 1.0000 UNO occupations found with the default tolerance.")
+
+print("\nUHF/UNO active orbitals from 0.02 < occupation < 1.98:")
+for idx, occ in uno_selection["active"]:
+    print(f"  UNO {idx:4d}   occupation = {occ:.5f}")
+
+print(f"\nUNO active electron count            : {uhf_uno_active_electrons}")
+print(f"UNO active orbital count             : {uhf_uno_active_orbitals}")
+print(f"UNO suggested active space           : CAS({uhf_uno_active_electrons},{uhf_uno_active_orbitals})")
+
+# ============================================================
+# orca_loc diagnostic
+# ============================================================
+
+section("LOCALIZED SOMO DIAGNOSTIC WITH ORCA_LOC")
+
+metal_symbol = infer_metal_symbol_from_geometry(MECP_geometry)
+metal_population_threshold = 0.93
+
+locinp_text = build_locinp_text(orb_gbw_filename, loc_filename, first_somo, last_somo)
+print("Generated orca_loc input:")
+print(locinp_text)
+
+local_locinp = os.path.join(local_soc, locinp_filename)
+write_local_text(local_locinp, locinp_text)
+
+orca_loc_output_text = ""
+remote_orca_loc_stdout = os.path.join(remote_soc, f"{orb_jobname}.orca_loc.out")
+orca_loc_command = None
+lmo_records = {}
+lmo_diagnostics = []
+orca_loc_failed = False
+orca_loc_failure_reason = ""
+
+try:
+    orca_loc_output_text, remote_orca_loc_stdout, orca_loc_command = run_orca_loc(
+        remote_soc,
+        locinp_filename
+    )
+
+    local_orca_loc_stdout = os.path.join(
+        local_soc,
+        os.path.basename(remote_orca_loc_stdout)
+    )
+    write_local_text(local_orca_loc_stdout, orca_loc_output_text)
+
+    print("\nORCA localized-orbital composition output:")
+    print(orca_loc_output_text)
+
+    lmo_records = parse_lmo_compositions_from_orca_loc_output(
+        orca_loc_output_text,
+        rohf_somo_indices
+    )
+
+    _, _, lmo_diagnostics = choose_soc_protocol_from_lmo_records(
+        lmo_records,
+        metal_symbol,
+        metal_population_threshold
+    )
+
+except Exception as err:
+    orca_loc_failed = True
+    orca_loc_failure_reason = str(err)
+    print("WARNING: orca_loc analysis failed, but Step 2 will continue.")
+    print("Reason:")
+    print(orca_loc_failure_reason)
+    print("The ROHF SOMO list and UHF/UNO active-space list are still available.")
+
+# ============================================================
+# SOC orbital source selection
+# ============================================================
+
+section("SOC ORBITAL SOURCE SELECTION")
+
+print(f"Detected metal symbol      : {metal_symbol}")
+print(f"Diagnostic metal threshold : {metal_population_threshold:.2f}")
+
+print("\nROHF active-space option:")
+print(f"  ROHF SOMOs              : {rohf_somo_indices}")
+print(f"  ROHF active space       : CAS({nel_soc},{norb_soc})")
+
+print("\nUHF/UNO active-space option:")
+print(f"  UNO SOMO-like orbitals  : {uhf_uno_somo_indices}")
+print(f"  UNO active orbitals     : {uhf_uno_active_indices}")
+print(f"  UNO active space        : CAS({uhf_uno_active_electrons},{uhf_uno_active_orbitals})")
+
+print("\nLocalized SOMO diagnostics:")
+if lmo_diagnostics:
+    for item in lmo_diagnostics:
+        print(
+            f"  MO {item['mo_index']:4d} | "
+            f"{metal_symbol} population = {item['metal_population']:.6f} | "
+            f"dominant atom = {item['dominant_atom_index']}{item['dominant_atom_symbol']} "
+            f"({item['dominant_population']:.6f}) | "
+            f"passes diagnostic threshold = {item['passes_threshold']}"
+        )
+else:
+    print("  No localized-orbital diagnostics available.")
+    
+print("\nReference orbital options for the SOC calculation")
+print("-------------------------------------------------")
+print("ROHF (recommended, default)")
+print("  • Uses restricted open-shell Hartree–Fock orbitals.")
+print("  • Recommended for most transition-metal systems.")
+print()
+print("UHF/UNO (advanced)")
+print("  • Uses unrestricted Hartree–Fock orbitals together with")
+print("    unrestricted natural orbitals (UNO) for active-space selection.")
+print("  • Intended primarily for difficult open-shell systems where")
+print("    ROHF convergence or orbital quality may be problematic.")
+print()
+print("In many applications, ROHF and UHF/UNO lead to similar active")
+print("spaces and effective SOC values. UHF/UNO is provided primarily")
+print("for challenging open-shell systems where ROHF convergence or")
+print("orbital quality may be problematic.")    
+
+if SOC_OUTPUT_ALREADY_COMPLETE:
+    print("\nExisting completed SOC output was detected before input generation.")
+    print("Skipping ROHF/UHF orbital-source question.")
+    print("The existing SOC .out file will be parsed directly.")
+    print("For bookkeeping only, ROHF/CAS SOMO settings are assigned as defaults.")
+
+    soc_orbital_source = "EXISTING_SOC_OUTPUT"
+    selected_soc_keyword = "EXISTING"
+    selected_soc_header_extra = ""
+    selected_active_indices = rohf_somo_indices
+    nel_soc_selected = nel_soc
+    norb_soc_selected = norb_soc
+
+else:
+    while True:
+        orbital_choice = safe_input("\nUse which orbitals for the generated SOC input? Enter ROHF or UHF (default ROHF): ").strip().lower()
+        if orbital_choice == "":
+            orbital_choice = "rohf"
+        if orbital_choice in ("rohf", "r"):
+            soc_orbital_source = "ROHF"
+            selected_soc_keyword = "ROHF"
+            selected_soc_header_extra = ""
+            selected_active_indices = rohf_somo_indices
+            nel_soc_selected = nel_soc
+            norb_soc_selected = norb_soc
+            break
+        if orbital_choice in ("uhf", "uno", "u"):
+            soc_orbital_source = "UHF_UNO"
+            selected_soc_keyword = "UHF"
+            selected_soc_header_extra = "UNO"
+            selected_active_indices = uhf_uno_active_indices
+            nel_soc_selected = uhf_uno_active_electrons
+            norb_soc_selected = uhf_uno_active_orbitals
+            break
+        print("  Please enter ROHF or UHF.")
+
+# Preserve backward-compatible names used by later code.
+nel_soc = int(nel_soc_selected)
+norb_soc = int(norb_soc_selected)
+soc_active_indices = list(selected_active_indices)
+
+if SOC_OUTPUT_ALREADY_COMPLETE:
+    soc_protocol = "EXISTING_SOC_OUTPUT_REUSED"
+    soc_protocol_reason = (
+        "A completed SOC .out file already existed at the start of Step 2. "
+        "Therefore no new SOC input was generated from ROHF or UHF/UNO choices, "
+        "and the ROHF/UHF orbital-source question was skipped. The existing SOC "
+        "output is parsed directly downstream."
+    )
+else:
+    soc_protocol = f"CASSCF_MAXITER_1_SOC_{soc_orbital_source}"
+    soc_protocol_reason = (
+        f"The generated SOC input uses an inline {soc_orbital_source} reference "
+        f"followed by CAS({nel_soc},{norb_soc}) inside a CASSCF block with "
+        "maxiter 1 and dosoc true. No %moinp/MoRead is used. "
+        "ROHF is the recommended default, while UHF/UNO is available as an "
+        "advanced option for challenging open-shell systems."
+    )
+
+print(f"\nSelected SOC orbital source          : {soc_orbital_source}")
+print(f"Selected active orbitals             : {soc_active_indices}")
+print(f"Selected active space                : CAS({nel_soc},{norb_soc})")
+print(f"Selected SOC protocol label          : {soc_protocol}")
+print(f"Selection rationale                  : {soc_protocol_reason}")
+
+# ============================================================
+# SOC input construction
+# ============================================================
+
+section("SOC INPUT CONSTRUCTION")
+
+soc_mults = [int(mult_main), int(mult_other)]
+
+rel_block = """%rel
+  SOCType 3
+  SOCFlags 1,4,3,0
+  SOCMaxCenter 4
+end
+
+"""
+
+
+def build_casscf_soc_input():
+    mult_list = ",".join(str(int(m)) for m in soc_mults)
+    nroots_list = ",".join("1" for _ in soc_mults)
+
+    if soc_orbital_source == "ROHF":
+        header = f"! ROHF {basis} TightSCF SlowConv"
+    elif soc_orbital_source == "UHF_UNO":
+        header = f"! UHF {basis} TightSCF SlowConv UNO"
+    else:
+        raise RuntimeError(f"Unknown SOC orbital source: {soc_orbital_source}")
+
+    blocks = step2_transfer_blocks(exclude_output=True)
+    output_block = step2_fixed_soc_output_block()
+
+    return f"""{header}
+
+{blocks}{rel_block}%casscf
+  maxiter 1
+  mult {mult_list}
+  nroots {nroots_list}
+  nel {nel_soc}
+  nOrb {norb_soc}
+
+  rel
+  dosoc true
+  dossc false
+  PrintLevel 3
+  TPrint 0.01
+  end
+end
+
+{output_block}* xyz {charge} {max(soc_mults)}
+{MECP_geometry}
+*
+"""
+
+if SOC_OUTPUT_ALREADY_COMPLETE:
+    if os.path.isfile(remote_soc_inp):
+        soc_inp_text_default = read_local_text_file(remote_soc_inp)
+    else:
+        soc_inp_text_default = (
+            "# Existing completed SOC output was reused.\n"
+            "# No SOC input was generated during this Step 2 run.\n"
+        )
+else:
+    soc_inp_text_default = build_casscf_soc_input()
+
+soc_job_label = f"CASSCF SOC calculation ({soc_orbital_source} orbitals)"
+
+print(f"Protocol selected for SOC input : {soc_protocol}")
+print(f"Orbital source in generated input: {soc_orbital_source}")
+print(f"Active space used in SOC input  : CAS({nel_soc},{norb_soc})")
+print("\nThe generated SOC input is fully editable before running.")
+print("The generated SOC input uses a %casscf block with maxiter 1. Step 1 %output is not transferred to SOC; SOC keeps its fixed %output block.")
+print("Because this input is intentionally editable, failure-repair validation uses free_full.")
+
+soc_status = soc_status_initial
+
+if soc_status == "OK":
+    print(f"Existing completed SOC output found for {soc_jobname}.")
+    print("Skipping SOC submission. Existing SOC output will be used.")
+    rerun_soc = False
+
+else:
+    print(f"No completed SOC output found for {soc_jobname}.")
+    print("Submitting SOC calculation.")
+    rerun_soc = True
+
+if rerun_soc:
+    soc_inp_text = edit_text_block_if_requested(
+        soc_inp_filename,
+        soc_inp_text_default
+    )
+
+    status, soc_inp_text = submit_and_monitor_orca_job(
+        remote_dir=remote_soc,
+        jobname_i=soc_jobname,
+        inp_text=soc_inp_text,
+        job_label=soc_job_label,
+        allow_interactive_repair=True,
+        repair_policy="free_full",
+        locked={}
+    )
+
+    if status != "OK":
+        raise SystemExit("SOC calculation did not complete successfully.")
+
+else:
+    soc_inp_text = soc_inp_text_default
+
+if not remote_file_exists(sftp, remote_soc_out):
+    raise RuntimeError(f"SOC output file was not found:\n{remote_soc_out}")
+    
+def extract_general_intermediate_soc_components(S_low, S_high, Ms_low, Ms_high, soc_matrix):
+    components = {}
+    z_count = 1
+    ib_count = 1
+    other_count = 1
+
+    for i, Ms_i in enumerate(Ms_low):
+        for j, Ms_j in enumerate(Ms_high):
+            value = soc_matrix[i, j]
+
+            if abs(value) <= 1.0e-12:
+                continue
+
+            delta_ms = Ms_j - Ms_i
+
+            if abs(delta_ms) < 1.0e-8:
+                key = f"z{z_count}"
+                z_count += 1
+
+            elif abs(abs(delta_ms) - 1.0) < 1.0e-8:
+                key = f"ib{ib_count}"
+                ib_count += 1
+
+            else:
+                key = f"other{other_count}_dMs_{delta_ms:+.1f}"
+                other_count += 1
+
+            components[key] = value
+
+    return components
+
+
+def effective_soc_from_intermediate_components(components):
+    active_components = {
+        key: value
+        for key, value in components.items()
+        if key.startswith("z") or key.startswith("ib")
+    }
+
+    return float(
+        np.sqrt(
+            np.sum([abs(value)**2 for value in active_components.values()])
+        )
+    )
+
+
+# ============================================================
+# Parse SOC output
+# ============================================================
+
+section("SOC MATRIX ELEMENT EXTRACTION")
+
+soc_out_text = read_remote_text_file(remote_soc_out)
+soc_values = parse_orca_soc_matrix_elements(soc_out_text)
+
+if not soc_values:
+    print("The SOC table is present, but no nonzero matrix elements were printed.")
+    print("The effective SOC is therefore assigned as zero.")
+
+S_low, S_high, Ms_low, Ms_high, SOC_Ms_matrix_cm1 = build_ms_resolved_soc_matrix(
+    soc_values,
+    soc_mults[0],
+    soc_mults[1]
+)
+
+SOC_Ms_abs_cm1 = np.abs(SOC_Ms_matrix_cm1)
+
+H_SO_channels_cm1 = channel_soc_dictionary(
+    S_low,
+    S_high,
+    Ms_low,
+    Ms_high,
+    SOC_Ms_matrix_cm1
+)
+
+H_SO_intermediate_components_cm1 = extract_general_intermediate_soc_components(
+    S_low,
+    S_high,
+    Ms_low,
+    Ms_high,
+    SOC_Ms_matrix_cm1
+)
+
+H_SO_full_matrix_norm_cm = compute_effective_soc_norm(
+    SOC_Ms_matrix_cm1
+)
+
+# The effective SOC is the full Ms-resolved matrix norm, not an RMS average
+# and not a unique-component norm.
+H_SO_ORCA_effective_cm = H_SO_full_matrix_norm_cm
+
+H_SO_ST_components_cm1 = {}
+H_SO_DQ_components_cm1 = {}
+H_SO_TQ_components_cm1 = {}
+H_SO_QS_components_cm1 = {}
+
+if abs(S_low - 0.0) < 1.0e-8 and abs(S_high - 1.0) < 1.0e-8:
+    H_SO_ST_components_cm1 = H_SO_intermediate_components_cm1
+
+elif abs(S_low - 0.5) < 1.0e-8 and abs(S_high - 1.5) < 1.0e-8:
+    H_SO_DQ_components_cm1 = H_SO_intermediate_components_cm1
+
+elif abs(S_low - 1.0) < 1.0e-8 and abs(S_high - 2.0) < 1.0e-8:
+    H_SO_TQ_components_cm1 = H_SO_intermediate_components_cm1
+
+elif abs(S_low - 1.5) < 1.0e-8 and abs(S_high - 2.5) < 1.0e-8:
+    H_SO_QS_components_cm1 = H_SO_intermediate_components_cm1
+
+SOC_CONVENTION_FACTOR = 1.0
+SOC_CONVENTION_LABEL = (
+    "Full Ms-resolved matrix norm: "
+    "sqrt(sum over all printed Ms and Ms_prime |H|^2); no RMS averaging"
+)
+
+H_SO_cm = H_SO_ORCA_effective_cm
+H_SO_source = "ORCA SOC calculation"
+
+print(f"Low-spin S value       : {S_low:.1f}")
+print(f"High-spin S value      : {S_high:.1f}")
+print(f"Low-spin Ms values     : {Ms_low}")
+print(f"High-spin Ms values    : {Ms_high}")
+
+print("\nMs-resolved complex SOC matrix in cm^-1:")
+print(SOC_Ms_matrix_cm1)
+
+print("\nAbsolute Ms-resolved SOC matrix in cm^-1:")
+print(SOC_Ms_abs_cm1)
+
+print("\nAll nonzero Ms-resolved SOC channels:")
+if H_SO_channels_cm1:
+    for key, value in H_SO_channels_cm1.items():
+        print(
+            f"  {key:35s} = "
+            f"{value.real: .6f} {value.imag:+.6f}i cm^-1   "
+            f"|H| = {abs(value):.6f}"
+        )
+else:
+    print("  No nonzero SOC channels were printed by ORCA.")
+
+print("\nIntermediate SOC components grouped by allowed spin-projection changes:")
+if H_SO_intermediate_components_cm1:
+    for key, value in H_SO_intermediate_components_cm1.items():
+        label = "used" if key.startswith("z") or key.startswith("ib") else "not used"
+        print(
+            f"  {key:18s} = "
+            f"{value.real: .6f} {value.imag:+.6f}i cm^-1   "
+            f"|H| = {abs(value):.6f}   [{label}]"
+        )
+else:
+    print("  No intermediate SOC components were identified.")
+
+print("\nEffective SOC from the full Ms-resolved matrix norm:")
+print(f"  H_SO_ORCA_effective_cm = {H_SO_ORCA_effective_cm:.6f} cm^-1")
+
+print("\nDiagnostic full-matrix norm:")
+print(
+    f"  H_SO_full_matrix_norm_cm = "
+    f"{H_SO_full_matrix_norm_cm:.6f} cm^-1"
+)
+
+# ============================================================
+# ORCA SOC operator convention and optional user override
+# ============================================================
+
+section("SOC OPERATOR CONVENTION")
+
+print("The ORCA SOC value printed above is obtained with the ORCA mean-field")
+print("spin-orbit treatment requested by the %rel block, here SOCType 3 with")
+print("SOCFlags 1,4,3,0 and SOCMaxCenter 4.")
+print()
+print("The exact Breit-Pauli spin-orbit operator contains one-electron and")
+print("two-electron terms. ORCA does not evaluate the full Breit-Pauli")
+print("operator directly in this workflow; instead, it uses an effective")
+print("one-electron mean-field approximation that includes the dominant")
+print("Coulomb and exchange contributions to the two-electron SOC operator.")
+print()
+print("Therefore, ORCA and GAMESS SOC values may differ if GAMESS is using a")
+print("full Breit-Pauli treatment or a different two-electron SOC convention.")
+
+SOC_EFFECTIVE_ONLY = False
+SOC_MATRIX_CHANNELS_AVAILABLE = True
+
+if ask_yes_no("\nUse a user-supplied SOC value instead of the ORCA effective SOC?", default=False):
+
+    while True:
+        H_SO_user_cm = ask_float("Enter the effective SOC value to use downstream in cm^-1: ")
+
+        if H_SO_user_cm < 0.0:
+            print("\nWARNING: SOC cannot be negative.")
+            print("Please enter a non-negative effective SOC value in cm^-1.\n")
+            continue
+
+        break
+
+    H_SO_cm = float(H_SO_user_cm)
+    H_SO_source = "User-supplied effective SOC value"
+
+    SOC_EFFECTIVE_ONLY = True
+    SOC_MATRIX_CHANNELS_AVAILABLE = False
+
+    # Disable channel/intermediate analysis because the user value is scalar only.
+    SOC_Ms_matrix_cm1 = np.zeros_like(SOC_Ms_matrix_cm1, dtype=complex)
+    SOC_Ms_matrix_scaled_cm1 = SOC_Ms_matrix_cm1.copy()
+    SOC_Ms_abs_cm1 = np.abs(SOC_Ms_matrix_cm1)
+    SOC_Ms_abs_scaled_cm1 = SOC_Ms_abs_cm1.copy()
+
+    H_SO_channels_cm1 = {}
+    H_SO_intermediate_components_cm1 = {}
+    H_SO_ST_components_cm1 = {}
+    H_SO_DQ_components_cm1 = {}
+    H_SO_TQ_components_cm1 = {}
+    H_SO_QS_components_cm1 = {}
+
+    print(f"\nUser-supplied effective SOC accepted: H_SO_cm = {H_SO_cm:.6f} cm^-1")
+    print("Downstream Steps 8–10 will run EFFECTIVE-ONLY probabilities and rates.")
+
+else:
+    H_SO_user_cm = None
+
+    if abs(float(H_SO_cm)) <= 1.0e-12 or len(H_SO_channels_cm1) == 0:
+        H_SO_cm = 0.0
+        H_SO_source = "Zero effective SOC from empty/nonzero-free ORCA SOC matrix"
+
+        SOC_EFFECTIVE_ONLY = True
+        SOC_MATRIX_CHANNELS_AVAILABLE = False
+
+        H_SO_channels_cm1 = {}
+        H_SO_intermediate_components_cm1 = {}
+        H_SO_ST_components_cm1 = {}
+        H_SO_DQ_components_cm1 = {}
+        H_SO_TQ_components_cm1 = {}
+        H_SO_QS_components_cm1 = {}
+
+        print("\nORCA SOC matrix has no usable nonzero channels.")
+        print("Effective SOC is set to zero.")
+        print("Downstream Steps 8–10 will run EFFECTIVE-ONLY zero-SOC probabilities and rates.")
+
+    else:
+        SOC_EFFECTIVE_ONLY = False
+        SOC_MATRIX_CHANNELS_AVAILABLE = True
+        print(f"\nUsing ORCA effective SOC downstream: H_SO_cm = {H_SO_cm:.6f} cm^-1")
+
+# Backward-compatible component dictionaries
+H_SO_ST_components_cm1 = {}
+H_SO_DQ_components_cm1 = {}
+H_SO_TQ_components_cm1 = {}
+H_SO_QS_components_cm1 = {}
+
+if abs(S_low - 0.0) < 1.0e-8 and abs(S_high - 1.0) < 1.0e-8:
+    H_SO_ST_components_cm1 = H_SO_intermediate_components_cm1
+if abs(S_low - 0.5) < 1.0e-8 and abs(S_high - 1.5) < 1.0e-8:
+    H_SO_DQ_components_cm1 = H_SO_intermediate_components_cm1
+if abs(S_low - 1.0) < 1.0e-8 and abs(S_high - 2.0) < 1.0e-8:
+    H_SO_TQ_components_cm1 = H_SO_intermediate_components_cm1
+if abs(S_low - 1.5) < 1.0e-8 and abs(S_high - 2.5) < 1.0e-8:
+    H_SO_QS_components_cm1 = H_SO_intermediate_components_cm1
+
+# ============================================================
+# Download and save outputs
+# ============================================================
+
+section("SAVING STEP 2 OUTPUTS")
+
+# Important files are already local in Local PC mode.
+SOC_FOLDER_REMOTE = remote_soc
+SOC_OUT_REMOTE = remote_soc_out
+SOC_INP_REMOTE = remote_soc_inp
+SOC_GBW_REMOTE = remote_orb_gbw
+SOC_LOC_REMOTE = remote_loc_file
+SOC_LOCINP_REMOTE = remote_locinp
+SOC_ORCA_LOC_STDOUT_REMOTE = remote_orca_loc_stdout
+
+soc_matrix_file = os.path.join(local_soc, "SOC_Ms_matrix.txt")
+soc_values_file = os.path.join(local_soc, "SOC_values.txt")
+active_diag_file = os.path.join(local_soc, "active_space_and_protocol.txt")
+loc_diag_file = os.path.join(local_soc, "orca_loc_output.txt")
+
+active_diag_lines = [
+    "Step 2 active-space and SOC protocol diagnostics",
+    "",
+    f"jobname = {jobname}",
+    f"charge = {charge}",
+    f"multiplicities = {multiplicities}",
+    f"mult_main = {mult_main}",
+    f"mult_other = {mult_other}",
+    f"high_spin_ROHF_multiplicity = {soc_orbital_mult}",
+    f"basis = {basis}",
+    "",
+    f"ROHF_GBW = {orb_gbw_filename}",
+    f"ROHF_OUT = {orb_out_filename}",
+    f"locinp_file = {locinp_filename}",
+    f"loc_file = {loc_filename}",
+    f"orca_loc_command = {orca_loc_command}",
+    "",
+    f"detected_SOMOs = {rohf_somo_indices}",
+    f"first_SOMO = {first_somo}",
+    f"last_SOMO = {last_somo}",
+    f"active_space = CAS({nel_soc},{norb_soc})",
+    f"soc_orbital_source = {soc_orbital_source}",
+    f"soc_active_indices = {soc_active_indices}",
+    f"ROHF_SOMOs = {rohf_somo_indices}",
+    f"UHF_UNO_SOMO_like_orbitals = {uhf_uno_somo_indices}",
+    f"UHF_UNO_active_orbitals = {uhf_uno_active_indices}",
+    f"UHF_UNO_active_space = CAS({uhf_uno_active_electrons},{uhf_uno_active_orbitals})",
+    f"orca_loc_failed = {orca_loc_failed}",
+    f"orca_loc_failure_reason = {orca_loc_failure_reason}",
+    f"metal_symbol = {metal_symbol}",
+    f"metal_population_threshold = {metal_population_threshold:.6f}",
+    "",
+    f"selected_SOC_protocol = {soc_protocol}",
+    f"selection_rationale = {soc_protocol_reason}",
+    "",
+    "Localized SOMO diagnostics:"
+]
+
+for item in lmo_diagnostics:
+    active_diag_lines.append(
+        f"MO {item['mo_index']} | metal_population = {item['metal_population']:.10f} | "
+        f"dominant_atom = {item['dominant_atom_index']}{item['dominant_atom_symbol']} | "
+        f"dominant_population = {item['dominant_population']:.10f} | "
+        f"passes_threshold = {item['passes_threshold']}"
+    )
+
+active_diag_lines += ["", "Generated SOC input:", soc_inp_text]
+write_local_text(active_diag_file, "\n".join(active_diag_lines) + "\n")
+write_local_text(loc_diag_file, orca_loc_output_text)
+
+matrix_lines = [
+    "Ms-resolved intermultiplicity SOC matrix",
+    "",
+    f"S_low = {S_low:.6f}",
+    f"S_high = {S_high:.6f}",
+    "Rows = low-spin Ms values",
+    " ".join(f"{x:.6f}" for x in Ms_low),
+    "Columns = high-spin Ms values",
+    " ".join(f"{x:.6f}" for x in Ms_high),
+    "",
+    "Complex SOC matrix entries as Real Imag in cm^-1:"
+]
+for i in range(SOC_Ms_matrix_cm1.shape[0]):
+    row = []
+    for j in range(SOC_Ms_matrix_cm1.shape[1]):
+        value = SOC_Ms_matrix_cm1[i, j]
+        row.append(f"({value.real:.10f},{value.imag:.10f})")
+    matrix_lines.append(" ".join(row))
+
+matrix_lines += ["", "Absolute SOC matrix in cm^-1:"]
+for i in range(SOC_Ms_abs_cm1.shape[0]):
+    matrix_lines.append(" ".join(f"{SOC_Ms_abs_cm1[i, j]:.10f}" for j in range(SOC_Ms_abs_cm1.shape[1])))
+
+matrix_lines += ["", "Intermediate SOC components:"]
+if H_SO_intermediate_components_cm1:
+    for key, value in H_SO_intermediate_components_cm1.items():
+        matrix_lines.append(f"{key}  {value.real:.10f}  {value.imag:.10f}  {abs(value):.10f}")
+else:
+    matrix_lines.append("No nonzero intermediate SOC components.")
+
+matrix_lines += [
+    "",
+    "Effective SOC:",
+    "Definition = sqrt(sum over all Ms and Ms_prime |<S,Ms|H_SO|S_prime,Ms_prime>|^2)",
+    "No empirical factor of 2 is applied.",
+    f"H_SO_ORCA_effective_cm = {H_SO_ORCA_effective_cm:.10f}",
+    f"H_SO_user_cm = {H_SO_user_cm}",
+    f"H_SO_cm = {H_SO_cm:.10f}",
+    f"H_SO_source = {H_SO_source}",
+    f"SOC_CONVENTION_LABEL = {SOC_CONVENTION_LABEL}"
+]
+write_local_text(soc_matrix_file, "\n".join(matrix_lines) + "\n")
+
+soc_value_lines = [
+    "Raw ORCA SOC table elements",
+    "",
+    "BraBlock BraRoot BraS BraMs KetBlock KetRoot KetS KetMs Real Imag Abs Type"
+]
+for item in soc_values:
+    tag = "inter" if item["intermultiplicity"] else "same-spin"
+    soc_value_lines.append(
+        f"{item['bra_block']:4d} {item['bra_root']:4d} "
+        f"{item['bra_S']:8.3f} {item['bra_Ms']:8.3f} "
+        f"{item['ket_block']:4d} {item['ket_root']:4d} "
+        f"{item['ket_S']:8.3f} {item['ket_Ms']:8.3f} "
+        f"{item['real']:14.8f} {item['imag']:14.8f} "
+        f"{item['abs_cm1']:14.8f} {tag}"
+    )
+if not soc_values:
+    soc_value_lines.append("No nonzero SOC matrix elements were printed by ORCA.")
+soc_value_lines += [
+    "",
+    f"H_SO_ORCA_effective_cm = {H_SO_ORCA_effective_cm:.10f}",
+    f"H_SO_cm = {H_SO_cm:.10f}",
+    f"H_SO_source = {H_SO_source}",
+    f"selected_SOC_protocol = {soc_protocol}"
+]
+write_local_text(soc_values_file, "\n".join(soc_value_lines) + "\n")
+
+# Diagnostic text files were written directly into the local SOC folder.
+
+# ============================================================
+# Export variables for later steps
+# ============================================================
+
+H_SO_raw_ORCA_norm_cm = H_SO_ORCA_effective_cm
+SOC_Ms_matrix_scaled_cm1 = SOC_Ms_matrix_cm1
+SOC_Ms_abs_scaled_cm1 = SOC_Ms_abs_cm1
+
+globals().update({
+    "H_SO_cm": H_SO_cm,
+    "H_SO_ORCA_effective_cm": H_SO_ORCA_effective_cm,
+    "H_SO_user_cm": H_SO_user_cm,
+    "H_SO_source": H_SO_source,
+    "H_SO_intermediate_components_cm1": H_SO_intermediate_components_cm1,
+    "H_SO_channels_cm1": H_SO_channels_cm1,
+    "H_SO_ST_components_cm1": H_SO_ST_components_cm1,
+    "H_SO_DQ_components_cm1": H_SO_DQ_components_cm1,
+    "H_SO_TQ_components_cm1": H_SO_TQ_components_cm1,
+    "H_SO_QS_components_cm1": H_SO_QS_components_cm1,
+    "H_SO_raw_ORCA_norm_cm": H_SO_raw_ORCA_norm_cm,
+    "H_SO_full_matrix_norm_cm": H_SO_full_matrix_norm_cm,
+    "SOC_Ms_matrix_cm1": SOC_Ms_matrix_cm1,
+    "SOC_Ms_matrix_scaled_cm1": SOC_Ms_matrix_scaled_cm1,
+    "SOC_EFFECTIVE_ONLY": SOC_EFFECTIVE_ONLY,
+    "SOC_MATRIX_CHANNELS_AVAILABLE": SOC_MATRIX_CHANNELS_AVAILABLE,
+    "SOC_Ms_abs_cm1": SOC_Ms_abs_cm1,
+    "SOC_Ms_abs_scaled_cm1": SOC_Ms_abs_scaled_cm1,
+    "SOC_CONVENTION_FACTOR": SOC_CONVENTION_FACTOR,
+    "SOC_CONVENTION_LABEL": SOC_CONVENTION_LABEL,
+    "soc_values": soc_values,
+    "rohf_somo_indices": rohf_somo_indices,
+    "uhf_uno_occupations": uno_occupations,
+    "uhf_uno_somo_indices": uhf_uno_somo_indices,
+    "uhf_uno_active_indices": uhf_uno_active_indices,
+    "uhf_uno_active_electrons": uhf_uno_active_electrons,
+    "uhf_uno_active_orbitals": uhf_uno_active_orbitals,
+    "soc_orbital_source": soc_orbital_source,
+    "soc_active_indices": soc_active_indices,
+    "orca_loc_failed": orca_loc_failed,
+    "orca_loc_failure_reason": orca_loc_failure_reason,
+    "soc_nel": nel_soc,
+    "soc_norb": norb_soc,
+    "soc_mults": soc_mults,
+    "soc_protocol": soc_protocol,
+    "soc_protocol_reason": soc_protocol_reason,
+    "lmo_diagnostics": lmo_diagnostics,
+    "metal_symbol": metal_symbol,
+    "metal_population_threshold": metal_population_threshold,
+    "SOC_FOLDER_REMOTE": SOC_FOLDER_REMOTE,
+    "SOC_OUT_REMOTE": SOC_OUT_REMOTE,
+    "SOC_INP_REMOTE": SOC_INP_REMOTE,
+    "SOC_GBW_REMOTE": SOC_GBW_REMOTE,
+    "SOC_LOC_REMOTE": SOC_LOC_REMOTE,
+    "SOC_LOCINP_REMOTE": SOC_LOCINP_REMOTE,
+    "SOC_ORCA_LOC_STDOUT_REMOTE": SOC_ORCA_LOC_STDOUT_REMOTE,
+    "soc_matrix_file": soc_matrix_file,
+    "soc_values_file": soc_values_file,
+    "active_diag_file": active_diag_file,
+    "loc_diag_file": loc_diag_file
+})
+
+# ============================================================
+# Final summary
+# ============================================================
+
+section("STEP 2 SUMMARY")
+
+print(f"Detected ROHF SOMOs            : {rohf_somo_indices}")
+print(f"Detected UHF/UNO active orbs   : {uhf_uno_active_indices}")
+print(f"SOC orbital source             : {soc_orbital_source}")
+print(f"Active space                   : CAS({nel_soc},{norb_soc})")
+print(f"Detected metal                 : {metal_symbol}")
+print(f"Selected SOC protocol          : {soc_protocol}")
+print(f"Effective ORCA SOC             : {H_SO_ORCA_effective_cm:.6f} cm^-1")
+print(f"Final SOC used downstream      : {H_SO_cm:.6f} cm^-1")
+print(f"SOC source                     : {H_SO_source}")
+
+print("\nImportant variables available for later steps:")
+print("  H_SO_cm")
+print("  H_SO_ORCA_effective_cm")
+print("  H_SO_user_cm")
+print("  H_SO_source")
+print("  H_SO_intermediate_components_cm1")
+print("  SOC_EFFECTIVE_ONLY")
+print("  SOC_MATRIX_CHANNELS_AVAILABLE")
+print("  H_SO_channels_cm1")
+print("  SOC_Ms_matrix_cm1")
+print("  SOC_Ms_abs_cm1")
+print("  soc_protocol")
+print("  rohf_somo_indices")
+print("  soc_nel, soc_norb")
+print("  SOC_FOLDER_REMOTE, SOC_OUT_REMOTE, SOC_INP_REMOTE")
+print("  SOC_GBW_REMOTE, SOC_LOC_REMOTE, SOC_LOCINP_REMOTE")
+
+print("\nSTEP 2 COMPLETED SUCCESSFULLY.\n")
+
+
+#%% STEP 3. Local PC DFT ENGRADIENTS AT MECP
+
+import os
+import numpy as np
+from pathlib import Path
+
+print(r'''
+====================================================================
+ STEP 3 | LOCAL PC VERSION
+ DFT Engrad calculations and gradient-difference extraction at MECP
+====================================================================
+
+This step uses the optimized MECP geometry from Step 1 and computes
+DFT analytical gradients for the two spin surfaces. These gradients are
+used to define the surface-gradient difference vector at the MECP.
+
+No SSH, no SFTP, no PBS/qsub, and no bash submission files are used.
+Both Engrad calculations are executed directly on this machine using the
+local ORCA execution functions defined in Local PC Step 1.
+''')
+
+# ============================================================
+# Required variables from previous steps
+# ============================================================
+
+required_vars_step3 = [
+    "jobname",
+    "MECP_geometry",
+    "charge",
+    "method",
+    "basis",
+    "nprocs",
+    "mem_gb",
+    "maxcore_mb",
+    "multiplicities",
+    "mult_main",
+    "mult_other",
+    "local_base",
+    "remote_base",
+    "submit_orca_job_no_monitor",
+    "monitor_submitted_orca_jobs",
+]
+
+for var in required_vars_step3:
+    if var not in globals():
+        raise RuntimeError(
+            f"Required variable '{var}' is missing. "
+            "Run Local PC Steps 1 and 2 first."
+        )
+
+workflow_mode = "MECP_ONLY"
+
+if not isinstance(MECP_geometry, str) or not MECP_geometry.strip():
+    raise RuntimeError("MECP_geometry is empty. Run Step 1 first.")
+
+RUN_MODE = globals().get("RUN_MODE", "LOCAL")
+
+# ============================================================
+# User-interface and utility helpers
+# ============================================================
+
+def section(title):
+    print("\n" + "=" * 72)
+    print(f" {title}")
+    print("=" * 72 + "\n")
+
+
+def subsection(title):
+    print("\n" + "-" * 72)
+    print(title)
+    print("-" * 72 + "\n")
+
+
+def multiplicity_name(mult):
+    return {
+        1: "singlet", 2: "doublet", 3: "triplet", 4: "quartet", 5: "quintet",
+        6: "sextet", 7: "septet", 8: "octet", 9: "nonet", 10: "decet"
+    }.get(int(mult), f"mult{mult}")
+
+
+def write_local_text(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+def read_local_text_file(local_path):
+    with open(local_path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+
+def clean_method_for_engrad(method_text):
+    excluded = {
+        "surfcrossopt", "surfcrossnumfreq", "numfreq", "freq", "opt", "engrad"
+    }
+    tokens = str(method_text).split()
+    clean_tokens = [token for token in tokens if token.lower() not in excluded]
+    return " ".join(clean_tokens).strip()
+
+
+def extract_gradient_from_engrad_text(engrad_text, source_label="engrad"):
+    lines = engrad_text.splitlines()
+    natoms = None
+
+    for i, line in enumerate(lines):
+        if "Number of atoms" in line:
+            for j in range(i + 1, min(i + 8, len(lines))):
+                stripped = lines[j].strip()
+                if stripped and not stripped.startswith("#"):
+                    natoms = int(stripped)
+                    break
+            break
+
+    if natoms is None:
+        raise RuntimeError(f"Could not read number of atoms from {source_label}.")
+
+    grad_start = None
+    for i, line in enumerate(lines):
+        if "The current gradient in Eh/bohr" in line:
+            grad_start = i + 1
+            break
+
+    if grad_start is None:
+        raise RuntimeError(f"Could not find gradient section in {source_label}.")
+
+    gradient_values = []
+    for line in lines[grad_start:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            if gradient_values:
+                break
+            continue
+        try:
+            gradient_values.append(float(stripped.split()[0]))
+        except ValueError:
+            if gradient_values:
+                break
+        if len(gradient_values) == 3 * natoms:
+            break
+
+    expected = 3 * natoms
+    if len(gradient_values) != expected:
+        raise RuntimeError(
+            f"Expected {expected} gradient values from {source_label}, "
+            f"but extracted {len(gradient_values)}."
+        )
+
+    return np.array(gradient_values, dtype=float), natoms
+
+
+def local_find_engrad_file(local_dir, jobname_i):
+    local_dir = Path(local_dir)
+    expected = local_dir / f"{jobname_i}.engrad"
+    if expected.exists():
+        return str(expected)
+    candidates = sorted(local_dir.glob(f"{jobname_i}*.engrad"))
+    if not candidates:
+        raise RuntimeError(f"No .engrad file was found for {jobname_i} in {local_dir}.")
+    return str(candidates[0])
+
+# ============================================================
+# Step 3 settings
+# ============================================================
+
+section("STEP 3 SETTINGS")
+
+engrad_mults = sorted([int(mult_main), int(mult_other)])
+if len(engrad_mults) != 2:
+    raise RuntimeError("Step 3 expects exactly two spin multiplicities.")
+
+engrad_method = clean_method_for_engrad(method)
+if not engrad_method:
+    raise RuntimeError("The Engrad method became empty after removing Opt/Freq/MECP keywords.")
+
+print("Workflow mode              : MECP_ONLY")
+print("Run mode                   : LOCAL PC")
+print("Gradient level             : DFT Engrad")
+print(f"Method                     : {engrad_method}")
+print(f"Basis set                  : {basis}")
+print(f"Spin multiplicities         : {engrad_mults}")
+print(f"Number of ORCA processors   : {nprocs}")
+print(f"MaxCore per processor       : {maxcore_mb} MB")
+print(f"Approximate total memory    : {nprocs * mem_gb} GB")
+
+# ============================================================
+# Directories and file names
+# ============================================================
+
+section("DIRECTORY PREPARATION")
+
+local_engrad = os.path.join(local_base, "Engrad")
+os.makedirs(local_engrad, exist_ok=True)
+remote_engrad = local_engrad
+
+print(f"Local Engrad directory       : {local_engrad}")
+print(f"remote_engrad local alias    : {remote_engrad}")
+
+# ============================================================
+# Engrad input construction
+# ============================================================
+
+def make_engrad_input(mult, scf_block_text, extra_keywords="SlowConv"):
+    # Prefer the reviewed Step 1 DFT header and % blocks. This propagates
+    # user edits such as B3LYP D3, %basis, %cpcm, %grid, %method, %scf, etc.
+    if "make_dft_pre_xyz" in globals():
+        new_pre = make_dft_pre_xyz("engrad")
+        return f'''{new_pre.rstrip()}
+
+* xyz {charge} {mult}
+{MECP_geometry}
+*
+'''
+
+    # Fallback for legacy sessions where Step 1 did not define make_dft_pre_xyz.
+    header = f"! Engrad {engrad_method} {basis} TightSCF"
+    if extra_keywords.strip():
+        header += " " + extra_keywords.strip()
+    return f'''{header}
+
+%pal nprocs {nprocs} end
+%maxcore {maxcore_mb}
+
+{scf_block_text}
+
+%output
+  PrintLevel 3
+end
+
+* xyz {charge} {mult}
+{MECP_geometry}
+*
+'''
+
+engrad_attempt_settings = [
+    {
+        "attempt": 1,
+        "extra_keywords": "SlowConv",
+        "scf": '''%scf
+  MaxIter 1500
+  SOSCFStart 0.01
+  LevelShift 0.5
+end'''
+    }
+]
+
+# ============================================================
+# Run both Engrad jobs locally
+# ============================================================
+
+section("RUNNING DFT ENGRAD JOBS")
+
+engrad_job_definitions = []
+for mult in engrad_mults:
+    spin_name = multiplicity_name(mult)
+    engrad_jobname = f"{jobname}_Engrad_{spin_name}"
+    inp_text = make_engrad_input(
+        mult=mult,
+        scf_block_text=engrad_attempt_settings[0]["scf"],
+        extra_keywords=engrad_attempt_settings[0]["extra_keywords"]
+    )
+    local_inp_path = os.path.join(local_engrad, f"{engrad_jobname}.inp")
+    write_local_text(local_inp_path, inp_text)
+    engrad_job_definitions.append({
+        "mult": mult,
+        "spin_name": spin_name,
+        "jobname": engrad_jobname,
+        "inp_text": inp_text,
+        "job_label": f"{spin_name} DFT Engrad at MECP"
+    })
+    subsection(f"Generated ORCA Engrad input | {engrad_jobname}.inp")
+    print(inp_text)
+
+submitted_engrad_jobs = []
+for job in engrad_job_definitions:
+    status, final_inp = submit_and_monitor_orca_job(
+        remote_dir=local_engrad,
+        jobname_i=job["jobname"],
+        inp_text=job["inp_text"],
+        job_label=job["job_label"],
+        allow_interactive_repair=True,
+        repair_policy="engrad_restricted",
+        locked={
+            "method": engrad_method,
+            "basis": basis,
+            "charge": charge,
+            "mult": job["mult"],
+            "geom": MECP_geometry,
+        }
+    )
+    submitted_engrad_jobs.append({
+        "jobname": job["jobname"],
+        "job_label": job["job_label"],
+        "status": status,
+        "short_id": "LOCAL",
+        "inp_text": final_inp,
+        "attempt": 1,
+        "mult": job["mult"],
+        "spin_name": job["spin_name"],
+        "repair_policy": "engrad_restricted",
+        "locked": {
+            "method": engrad_method,
+            "basis": basis,
+            "charge": charge,
+            "mult": job["mult"],
+            "geom": MECP_geometry,
+        }
+    })
+
+print("\nBoth spin-state Engrad jobs have been run and checked locally.\n")
+
+submitted_engrad_jobs = monitor_submitted_orca_jobs(
+    local_engrad,
+    submitted_engrad_jobs,
+    allow_interactive_repair=True
+)
+
+for job_record in submitted_engrad_jobs:
+    if job_record["status"] != "OK":
+        raise SystemExit(f"{job_record['jobname']} did not complete successfully.")
+
+# ============================================================
+# Extract gradients from local .engrad files
+# ============================================================
+
+section("EXTRACTING GRADIENTS FROM ENGRAD FILES")
+
+gradients_by_multiplicity = {}
+gradients_by_name = {}
+natoms_by_multiplicity = {}
+engrad_files_remote = {}
+engrad_files_local = {}
+
+for job_record in submitted_engrad_jobs:
+    mult = int(job_record["mult"])
+    spin_name = job_record["spin_name"]
+    engrad_jobname = job_record["jobname"]
+    local_engrad_file = local_find_engrad_file(local_engrad, engrad_jobname)
+    engrad_files_local[mult] = local_engrad_file
+    engrad_files_remote[mult] = local_engrad_file
+
+    engrad_text = read_local_text_file(local_engrad_file)
+    gradient, natoms = extract_gradient_from_engrad_text(engrad_text, source_label=local_engrad_file)
+
+    gradients_by_multiplicity[mult] = gradient
+    gradients_by_name[spin_name] = gradient
+    natoms_by_multiplicity[mult] = natoms
+    globals()[f"g_{spin_name}"] = gradient
+    write_local_text(os.path.join(local_engrad, f"{engrad_jobname}.inp"), job_record["inp_text"])
+
+    print(f"g_{spin_name} extracted from {os.path.basename(local_engrad_file)}")
+    print(f"  multiplicity = {mult}")
+    print(f"  atoms        = {natoms}")
+    print(f"  gradient len = {gradient.size}")
+    print(f"  first 5 vals = {gradient[:5]}\n")
+
+# ============================================================
+# Define low-spin and high-spin gradients
+# ============================================================
+
+section("SURFACE-GRADIENT DEFINITIONS")
+
+available_mults = sorted(gradients_by_multiplicity.keys())
+
+if len(available_mults) != 2:
+    raise RuntimeError(
+        "Exactly two spin-surface gradients are required for crossing analysis."
+    )
+
+mult_LS = available_mults[0]
+mult_HS = available_mults[-1]
+
+spin_name_LS = multiplicity_name(mult_LS)
+spin_name_HS = multiplicity_name(mult_HS)
+
+g_LS = np.asarray(
+    gradients_by_multiplicity[mult_LS],
+    dtype=float
+).reshape(-1)
+
+g_HS = np.asarray(
+    gradients_by_multiplicity[mult_HS],
+    dtype=float
+).reshape(-1)
+
+if g_LS.shape != g_HS.shape:
+    raise RuntimeError(
+        f"Gradient size mismatch: g_LS shape {g_LS.shape}, "
+        f"g_HS shape {g_HS.shape}."
+    )
+
+surface_gradient_difference_cart = g_LS - g_HS
+reverse_surface_gradient_difference_cart = g_HS - g_LS
+
+gradient_gap_norm_Eh_per_Bohr = float(
+    np.linalg.norm(surface_gradient_difference_cart)
+)
+
+if (
+    not np.isfinite(gradient_gap_norm_Eh_per_Bohr)
+    or gradient_gap_norm_Eh_per_Bohr <= 0.0
+):
+    raise RuntimeError(
+        "Invalid surface-gradient difference norm. Check the Engrad outputs."
+    )
+
+GRADIENT_GAP_NORM_EH_PER_BOHR = gradient_gap_norm_Eh_per_Bohr
+gradient_gap_magnitude = GRADIENT_GAP_NORM_EH_PER_BOHR
+
+g_LS_norm_Eh_per_Bohr = float(np.linalg.norm(g_LS))
+g_HS_norm_Eh_per_Bohr = float(np.linalg.norm(g_HS))
+
+cartesian_geometric_mean_gradient_Eh_per_Bohr = float(
+    np.sqrt(
+        g_LS_norm_Eh_per_Bohr
+        * g_HS_norm_Eh_per_Bohr
+    )
+)
+
+CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR = (
+    cartesian_geometric_mean_gradient_Eh_per_Bohr
+)
+
+gradient_difference_unit_vector = (
+    surface_gradient_difference_cart
+    / gradient_gap_norm_Eh_per_Bohr
+)
+
+reverse_gradient_unit_vector = (
+    reverse_surface_gradient_difference_cart
+    / gradient_gap_norm_Eh_per_Bohr
+)
+
+MECP_seam_normal_cart = reverse_gradient_unit_vector.copy()
+reaction_direction_cart = reverse_gradient_unit_vector.copy()
+
+print(f"Low-spin surface              : {spin_name_LS}, multiplicity {mult_LS}")
+print(f"High-spin surface             : {spin_name_HS}, multiplicity {mult_HS}")
+
+print("\nMECP gradient diagnostics:")
+print(
+    f"  ||g_LS||                                  = "
+    f"{g_LS_norm_Eh_per_Bohr:.12e} Eh/Bohr"
+)
+print(
+    f"  ||g_HS||                                  = "
+    f"{g_HS_norm_Eh_per_Bohr:.12e} Eh/Bohr"
+)
+print(
+    f"  Cartesian geometric mean                 = "
+    f"{cartesian_geometric_mean_gradient_Eh_per_Bohr:.12e} Eh/Bohr"
+)
+print(
+    f"  ||g_LS - g_HS||                          = "
+    f"{GRADIENT_GAP_NORM_EH_PER_BOHR:.12e} Eh/Bohr"
+)
+print(
+    f"  ||gradient_difference_unit_vector||      = "
+    f"{np.linalg.norm(gradient_difference_unit_vector):.8f}"
+)
+print(
+    f"  ||reverse_gradient_unit_vector||         = "
+    f"{np.linalg.norm(reverse_gradient_unit_vector):.8f}"
+)
+print(
+    "  NOTE: PROJECTED_GRADIENT_MEAN_EH_PER_BOHR is calculated "
+    "later from the selected effective-Hessian reaction coordinate."
+)
+
+# ============================================================
+# Save gradient summary
+# ============================================================
+
+section("SAVING STEP 3 OUTPUTS")
+
+local_grad_file = os.path.join(
+    local_engrad,
+    "Engrad_gradients_summary.txt"
+)
+
+summary_lines = []
+summary_lines.append("DFT Engrad gradients extracted at the MECP")
+summary_lines.append("Workflow mode = MECP_ONLY")
+summary_lines.append("Run mode = LOCAL")
+summary_lines.append(f"Engrad method = {engrad_method}")
+summary_lines.append(f"Basis = {basis}")
+summary_lines.append(f"Charge = {charge}")
+summary_lines.append(f"Multiplicities = {engrad_mults}")
+summary_lines.append("")
+summary_lines.append(
+    f"Low-spin multiplicity = {mult_LS} ({spin_name_LS})"
+)
+summary_lines.append(
+    f"High-spin multiplicity = {mult_HS} ({spin_name_HS})"
+)
+summary_lines.append("")
+summary_lines.append(
+    f"g_LS_norm_Eh_per_Bohr = "
+    f"{g_LS_norm_Eh_per_Bohr:.12e}"
+)
+summary_lines.append(
+    f"g_HS_norm_Eh_per_Bohr = "
+    f"{g_HS_norm_Eh_per_Bohr:.12e}"
+)
+summary_lines.append(
+    f"GRADIENT_GAP_NORM_EH_PER_BOHR = "
+    f"{GRADIENT_GAP_NORM_EH_PER_BOHR:.12e}"
+)
+summary_lines.append(
+    f"CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR = "
+    f"{CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR:.12e}"
+)
+summary_lines.append("")
+summary_lines.append(
+    "PROJECTED_GRADIENT_MEAN_EH_PER_BOHR is intentionally not "
+    "defined in Step 3."
+)
+summary_lines.append(
+    "It is calculated later from the selected effective-Hessian "
+    "reaction coordinate."
+)
+summary_lines.append("")
+summary_lines.append("Local Engrad files:")
+
+for mult in available_mults:
+    summary_lines.append(
+        f"  multiplicity {mult}: {engrad_files_local[mult]}"
+    )
+
+for spin_name, gradient in gradients_by_name.items():
+    summary_lines.append("")
+    summary_lines.append(f"# g_{spin_name}")
+    for value in gradient:
+        summary_lines.append(f"{value: .12f}")
+
+summary_lines.append("")
+summary_lines.append(
+    "# surface_gradient_difference_cart = g_LS - g_HS"
+)
+for value in surface_gradient_difference_cart:
+    summary_lines.append(f"{value: .12f}")
+
+summary_lines.append("")
+summary_lines.append(
+    "# reverse_surface_gradient_difference_cart = g_HS - g_LS"
+)
+for value in reverse_surface_gradient_difference_cart:
+    summary_lines.append(f"{value: .12f}")
+
+summary_lines.append("")
+summary_lines.append("# gradient_difference_unit_vector")
+for value in gradient_difference_unit_vector:
+    summary_lines.append(f"{value: .12f}")
+
+summary_lines.append("")
+summary_lines.append("# reverse_gradient_unit_vector")
+for value in reverse_gradient_unit_vector:
+    summary_lines.append(f"{value: .12f}")
+
+write_local_text(
+    local_grad_file,
+    "\n".join(summary_lines) + "\n"
+)
+
+remote_grad_file = local_grad_file
+
+# ============================================================
+# Export variables for later steps
+# ============================================================
+
+globals().update({
+    "remote_engrad": remote_engrad,
+    "local_engrad": local_engrad,
+    "engrad_method": engrad_method,
+    "engrad_mults": engrad_mults,
+    "engrad_job_records": submitted_engrad_jobs,
+    "gradients_by_multiplicity": gradients_by_multiplicity,
+    "gradients_by_name": gradients_by_name,
+    "natoms_by_multiplicity": natoms_by_multiplicity,
+    "engrad_files_remote": engrad_files_remote,
+    "engrad_files_local": engrad_files_local,
+
+    "mult_LS": mult_LS,
+    "mult_HS": mult_HS,
+    "spin_name_LS": spin_name_LS,
+    "spin_name_HS": spin_name_HS,
+
+    "g_LS": g_LS,
+    "g_HS": g_HS,
+    "g_LS_norm_Eh_per_Bohr": g_LS_norm_Eh_per_Bohr,
+    "g_HS_norm_Eh_per_Bohr": g_HS_norm_Eh_per_Bohr,
+
+    "surface_gradient_difference_cart":
+        surface_gradient_difference_cart,
+    "reverse_surface_gradient_difference_cart":
+        reverse_surface_gradient_difference_cart,
+
+    "gradient_gap_norm_Eh_per_Bohr":
+        gradient_gap_norm_Eh_per_Bohr,
+    "GRADIENT_GAP_NORM_EH_PER_BOHR":
+        GRADIENT_GAP_NORM_EH_PER_BOHR,
+    "gradient_gap_magnitude":
+        gradient_gap_magnitude,
+
+    "cartesian_geometric_mean_gradient_Eh_per_Bohr":
+        cartesian_geometric_mean_gradient_Eh_per_Bohr,
+    "CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR":
+        CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR,
+
+    "gradient_difference_unit_vector":
+        gradient_difference_unit_vector,
+    "reverse_gradient_unit_vector":
+        reverse_gradient_unit_vector,
+    "MECP_seam_normal_cart":
+        MECP_seam_normal_cart,
+    "reaction_direction_cart":
+        reaction_direction_cart,
+
+    "local_grad_file": local_grad_file,
+    "remote_grad_file": remote_grad_file
+})
+
+# ============================================================
+# Final summary
+# ============================================================
+
+section("STEP 3 SUMMARY")
+
+print(f"Engrad method                            : {engrad_method}")
+print(f"Basis                                    : {basis}")
+print(
+    f"Low-spin surface                         : "
+    f"{spin_name_LS}, multiplicity {mult_LS}"
+)
+print(
+    f"High-spin surface                        : "
+    f"{spin_name_HS}, multiplicity {mult_HS}"
+)
+print(
+    f"GRADIENT_GAP_NORM_EH_PER_BOHR            : "
+    f"{GRADIENT_GAP_NORM_EH_PER_BOHR:.12e}"
+)
+print(
+    f"CARTESIAN_GEOMETRIC_MEAN_GRADIENT        : "
+    f"{CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR:.12e}"
+)
+print(f"Gradient summary, local                  : {local_grad_file}")
+print(f"Gradient summary, alias                  : {remote_grad_file}")
+
+print("\nImportant variables available for later steps:")
+print("  g_LS")
+print("  g_HS")
+print("  surface_gradient_difference_cart")
+print("  reverse_surface_gradient_difference_cart")
+print("  gradient_difference_unit_vector")
+print("  reverse_gradient_unit_vector")
+print("  MECP_seam_normal_cart")
+print("  reaction_direction_cart")
+print("  GRADIENT_GAP_NORM_EH_PER_BOHR")
+print("  gradient_gap_magnitude")
+print("  CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR")
+print("  cartesian_geometric_mean_gradient_Eh_per_Bohr")
+print("  gradients_by_multiplicity")
+print("  gradients_by_name")
+print("  local_grad_file")
+print("  remote_grad_file")
+
+print(
+    "\nPROJECTED_GRADIENT_MEAN_EH_PER_BOHR is intentionally not "
+    "defined in Step 3."
+)
+print(
+    "The projected value is calculated later from the effective-Hessian "
+    "reaction coordinate."
+)
+
+print("\nSTEP 3 COMPLETED SUCCESSFULLY.\n")
+
+
+#%% STEP 4. Local PC MECP CARTESIAN GRADIENT AND REACTION-COORDINATE DEFINITIONS
+
+import os
+import numpy as np
+
+print(r'''
+====================================================================
+ STEP 4 | LOCAL PC VERSION
+ MECP Cartesian gradient definitions and reaction-coordinate vector
+====================================================================
+
+This step uses the two DFT Engrad gradients extracted at the MECP in
+Step 3. No additional ORCA calculation is performed here.
+
+No SSH, no SFTP, no PBS/qsub, and no remote directories are used.
+
+The primary surface-gradient difference is defined as
+
+    surface_gradient_difference_cart = g_LS - g_HS
+
+with Cartesian magnitude
+
+    GRADIENT_GAP_NORM_EH_PER_BOHR = ||g_LS - g_HS||
+
+The opposite orientation,
+
+    reverse_surface_gradient_difference_cart = g_HS - g_LS
+
+is retained explicitly for direction-dependent downstream operations.
+
+The quantity
+
+    CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR
+        = sqrt(||g_LS|| * ||g_HS||)
+
+is retained only as a Cartesian-gradient diagnostic. The final
+reaction-coordinate-projected gradient mean is calculated later from
+the selected effective-Hessian reaction coordinate.
+''')
+
+# ============================================================
+# Required variables from Steps 1–3
+# ============================================================
+
+required_vars_step4 = [
+    "jobname",
+    "MECP_geometry",
+    "Reference_geometry",
+    "g_LS",
+    "g_HS",
+    "mult_LS",
+    "mult_HS",
+    "spin_name_LS",
+    "spin_name_HS",
+    "local_base",
+    "remote_base"
+]
+
+for var in required_vars_step4:
+    if var not in globals():
+        raise RuntimeError(
+            f"Required variable '{var}' is missing. Run Local PC Steps 1–3 first."
+        )
+
+RUN_MODE = globals().get("RUN_MODE", "LOCAL")
+workflow_mode = "MECP_ONLY"
+
+# Prevent a stale projected gradient mean from a previous execution from
+# being mistaken for a Step 4 result. The projected value is created later
+# by the effective-Hessian/reaction-coordinate step.
+globals().pop("PROJECTED_GRADIENT_MEAN_EH_PER_BOHR", None)
+globals().pop("projected_gradient_mean_Eh_per_Bohr", None)
+globals().pop("projected_gradient_mean", None)
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+def section(title):
+    print("\n" + "=" * 72)
+    print(f" {title}")
+    print("=" * 72 + "\n")
+
+
+def write_local_text(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+# ============================================================
+# Gradient preparation
+# ============================================================
+
+section("MECP CARTESIAN GRADIENT DEFINITIONS")
+
+g_LS = np.asarray(g_LS, dtype=float).reshape(-1)
+g_HS = np.asarray(g_HS, dtype=float).reshape(-1)
+
+if g_LS.shape != g_HS.shape:
+    raise RuntimeError(
+        f"g_LS and g_HS have different sizes: "
+        f"{g_LS.shape} vs {g_HS.shape}"
+    )
+
+surface_gradient_difference_cart = g_LS - g_HS
+reverse_surface_gradient_difference_cart = g_HS - g_LS
+
+gradient_gap_norm_Eh_per_Bohr = float(
+    np.linalg.norm(surface_gradient_difference_cart)
+)
+
+if (
+    not np.isfinite(gradient_gap_norm_Eh_per_Bohr)
+    or gradient_gap_norm_Eh_per_Bohr <= 0.0
+):
+    raise RuntimeError(
+        "Invalid ||g_LS - g_HS||. Check the Step 3 Engrad outputs."
+    )
+
+GRADIENT_GAP_NORM_EH_PER_BOHR = gradient_gap_norm_Eh_per_Bohr
+gradient_gap_magnitude = GRADIENT_GAP_NORM_EH_PER_BOHR
+
+g_LS_norm_Eh_per_Bohr = float(np.linalg.norm(g_LS))
+g_HS_norm_Eh_per_Bohr = float(np.linalg.norm(g_HS))
+
+cartesian_geometric_mean_gradient_Eh_per_Bohr = float(
+    np.sqrt(
+        g_LS_norm_Eh_per_Bohr
+        * g_HS_norm_Eh_per_Bohr
+    )
+)
+
+CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR = (
+    cartesian_geometric_mean_gradient_Eh_per_Bohr
+)
+
+gradient_dot_product = float(np.dot(g_LS, g_HS))
+
+if gradient_dot_product < 0.0:
+    intersection_type = "peaked"
+else:
+    intersection_type = "sloped"
+
+effective_hessian_mix_coefficient = float(
+    np.dot(
+        surface_gradient_difference_cart,
+        g_LS
+    )
+    / gradient_gap_norm_Eh_per_Bohr**2
+)
+
+gradient_difference_unit_vector = (
+    surface_gradient_difference_cart
+    / gradient_gap_norm_Eh_per_Bohr
+)
+
+reverse_gradient_unit_vector = (
+    reverse_surface_gradient_difference_cart
+    / gradient_gap_norm_Eh_per_Bohr
+)
+
+MECP_seam_normal_cart = reverse_gradient_unit_vector.copy()
+reaction_direction_cart = reverse_gradient_unit_vector.copy()
+
+IRC_frames = None
+IRC_energies_hartree = None
+coords_all = None
+irc = None
+symbols_irc = None
+TS_geometry = None
+irc_tangent = None
+TS_index = None
+
+print("MECP-only workflow confirmed.")
+print("No TS geometry, IRC path, or IRC tangent is used in this workflow.")
+
+print("\nSelected spin surfaces:")
+print(
+    f"  Low-spin surface   : "
+    f"{spin_name_LS}, multiplicity {mult_LS}"
+)
+print(
+    f"  High-spin surface  : "
+    f"{spin_name_HS}, multiplicity {mult_HS}"
+)
+
+print("\nCartesian gradient definitions:")
+print("  surface_gradient_difference_cart = g_LS - g_HS")
+print("  reverse_surface_gradient_difference_cart = g_HS - g_LS")
+print("  gradient gap magnitude = ||g_LS - g_HS||")
+print("  Cartesian geometric mean = sqrt(||g_LS|| * ||g_HS||)")
+print(
+    "  effective-Hessian mixing coefficient = "
+    "dot(g_LS - g_HS, g_LS) / ||g_LS - g_HS||^2"
+)
+print(
+    "  NOTE: PROJECTED_GRADIENT_MEAN_EH_PER_BOHR is calculated later."
+)
+
+print("\nGradient diagnostics:")
+print(
+    f"  ||g_LS||                                  = "
+    f"{g_LS_norm_Eh_per_Bohr:.12e} Eh/Bohr"
+)
+print(
+    f"  ||g_HS||                                  = "
+    f"{g_HS_norm_Eh_per_Bohr:.12e} Eh/Bohr"
+)
+print(
+    f"  g_LS · g_HS                               = "
+    f"{gradient_dot_product:.12e}"
+)
+print(f"  intersection_type                         = {intersection_type}")
+print(
+    f"  GRADIENT_GAP_NORM_EH_PER_BOHR             = "
+    f"{GRADIENT_GAP_NORM_EH_PER_BOHR:.12e} Eh/Bohr"
+)
+print(
+    f"  CARTESIAN_GEOMETRIC_MEAN_GRADIENT         = "
+    f"{CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR:.12e} Eh/Bohr"
+)
+print(
+    f"  effective_hessian_mix_coefficient         = "
+    f"{effective_hessian_mix_coefficient:.12e}"
+)
+print(
+    f"  ||gradient_difference_unit_vector||       = "
+    f"{np.linalg.norm(gradient_difference_unit_vector):.8f}"
+)
+print(
+    f"  ||reverse_gradient_unit_vector||          = "
+    f"{np.linalg.norm(reverse_gradient_unit_vector):.8f}"
+)
+
+# ============================================================
+# Save Step 4 outputs
+# ============================================================
+
+section("SAVING STEP 4 OUTPUTS")
+
+local_step4 = os.path.join(
+    local_base,
+    "MECP_gradient_definitions"
+)
+os.makedirs(local_step4, exist_ok=True)
+
+remote_step4 = local_step4
+
+local_step4_file = os.path.join(
+    local_step4,
+    "MECP_gradient_definitions.txt"
+)
+
+summary_lines = []
+
+summary_lines.append(
+    "MECP Cartesian gradient and reaction-coordinate definitions"
+)
+summary_lines.append("Workflow mode = MECP_ONLY")
+summary_lines.append(f"Run mode = {RUN_MODE}")
+summary_lines.append("")
+summary_lines.append(
+    f"Low-spin multiplicity = {mult_LS} ({spin_name_LS})"
+)
+summary_lines.append(
+    f"High-spin multiplicity = {mult_HS} ({spin_name_HS})"
+)
+summary_lines.append("")
+summary_lines.append("Definitions:")
+summary_lines.append(
+    "surface_gradient_difference_cart = g_LS - g_HS"
+)
+summary_lines.append(
+    "reverse_surface_gradient_difference_cart = g_HS - g_LS"
+)
+summary_lines.append(
+    "GRADIENT_GAP_NORM_EH_PER_BOHR = ||g_LS - g_HS||"
+)
+summary_lines.append(
+    "CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR = "
+    "sqrt(||g_LS|| * ||g_HS||)"
+)
+summary_lines.append(
+    "PROJECTED_GRADIENT_MEAN_EH_PER_BOHR is calculated later "
+    "and is not defined in Step 4."
+)
+summary_lines.append("")
+summary_lines.append(
+    f"g_LS_norm_Eh_per_Bohr = {g_LS_norm_Eh_per_Bohr:.12e}"
+)
+summary_lines.append(
+    f"g_HS_norm_Eh_per_Bohr = {g_HS_norm_Eh_per_Bohr:.12e}"
+)
+summary_lines.append(
+    f"gradient_dot_product = {gradient_dot_product:.12e}"
+)
+summary_lines.append(f"intersection_type = {intersection_type}")
+summary_lines.append(
+    f"GRADIENT_GAP_NORM_EH_PER_BOHR = "
+    f"{GRADIENT_GAP_NORM_EH_PER_BOHR:.12e}"
+)
+summary_lines.append(
+    f"CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR = "
+    f"{CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR:.12e}"
+)
+summary_lines.append(
+    f"effective_hessian_mix_coefficient = "
+    f"{effective_hessian_mix_coefficient:.12e}"
+)
+summary_lines.append("")
+
+summary_lines.append("# g_LS")
+for value in g_LS:
+    summary_lines.append(f"{value: .12f}")
+
+summary_lines.append("")
+summary_lines.append("# g_HS")
+for value in g_HS:
+    summary_lines.append(f"{value: .12f}")
+
+summary_lines.append("")
+summary_lines.append(
+    "# surface_gradient_difference_cart = g_LS - g_HS"
+)
+for value in surface_gradient_difference_cart:
+    summary_lines.append(f"{value: .12f}")
+
+summary_lines.append("")
+summary_lines.append(
+    "# reverse_surface_gradient_difference_cart = g_HS - g_LS"
+)
+for value in reverse_surface_gradient_difference_cart:
+    summary_lines.append(f"{value: .12f}")
+
+summary_lines.append("")
+summary_lines.append("# gradient_difference_unit_vector")
+for value in gradient_difference_unit_vector:
+    summary_lines.append(f"{value: .12f}")
+
+summary_lines.append("")
+summary_lines.append("# reverse_gradient_unit_vector")
+for value in reverse_gradient_unit_vector:
+    summary_lines.append(f"{value: .12f}")
+
+write_local_text(
+    local_step4_file,
+    "\n".join(summary_lines) + "\n"
+)
+
+remote_step4_file = local_step4_file
+
+print(f"Local Step 4 summary       : {local_step4_file}")
+print(f"remote_step4_file alias    : {remote_step4_file}")
+
+# ============================================================
+# Export variables for later steps
+# ============================================================
+
+globals().update({
+    "RUN_MODE": RUN_MODE,
+    "workflow_mode": workflow_mode,
+    "g_LS": g_LS,
+    "g_HS": g_HS,
+    "g_LS_norm_Eh_per_Bohr": g_LS_norm_Eh_per_Bohr,
+    "g_HS_norm_Eh_per_Bohr": g_HS_norm_Eh_per_Bohr,
+    "surface_gradient_difference_cart":
+        surface_gradient_difference_cart,
+    "reverse_surface_gradient_difference_cart":
+        reverse_surface_gradient_difference_cart,
+    "gradient_gap_norm_Eh_per_Bohr":
+        gradient_gap_norm_Eh_per_Bohr,
+    "GRADIENT_GAP_NORM_EH_PER_BOHR":
+        GRADIENT_GAP_NORM_EH_PER_BOHR,
+    "gradient_gap_magnitude":
+        gradient_gap_magnitude,
+    "cartesian_geometric_mean_gradient_Eh_per_Bohr":
+        cartesian_geometric_mean_gradient_Eh_per_Bohr,
+    "CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR":
+        CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR,
+    "gradient_dot_product":
+        gradient_dot_product,
+    "intersection_type":
+        intersection_type,
+    "effective_hessian_mix_coefficient":
+        effective_hessian_mix_coefficient,
+    "gradient_difference_unit_vector":
+        gradient_difference_unit_vector,
+    "reverse_gradient_unit_vector":
+        reverse_gradient_unit_vector,
+    "MECP_seam_normal_cart":
+        MECP_seam_normal_cart,
+    "reaction_direction_cart":
+        reaction_direction_cart,
+    "IRC_frames": IRC_frames,
+    "IRC_energies_hartree": IRC_energies_hartree,
+    "coords_all": coords_all,
+    "irc": irc,
+    "symbols_irc": symbols_irc,
+    "TS_geometry": TS_geometry,
+    "irc_tangent": irc_tangent,
+    "TS_index": TS_index,
+    "local_step4": local_step4,
+    "remote_step4": remote_step4,
+    "local_step4_file": local_step4_file,
+    "remote_step4_file": remote_step4_file
+})
+
+# ============================================================
+# Final summary
+# ============================================================
+
+section("STEP 4 SUMMARY")
+
+print(
+    f"Low-spin surface                         : "
+    f"{spin_name_LS}, multiplicity {mult_LS}"
+)
+print(
+    f"High-spin surface                        : "
+    f"{spin_name_HS}, multiplicity {mult_HS}"
+)
+print(f"Intersection type                        : {intersection_type}")
+print(
+    f"GRADIENT_GAP_NORM_EH_PER_BOHR            : "
+    f"{GRADIENT_GAP_NORM_EH_PER_BOHR:.12e}"
+)
+print(
+    f"CARTESIAN_GEOMETRIC_MEAN_GRADIENT        : "
+    f"{CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR:.12e}"
+)
+print(
+    f"effective_hessian_mix_coefficient        : "
+    f"{effective_hessian_mix_coefficient:.12e}"
+)
+
+print("\nImportant variables available for later steps:")
+print("  surface_gradient_difference_cart")
+print("  reverse_surface_gradient_difference_cart")
+print("  gradient_difference_unit_vector")
+print("  reverse_gradient_unit_vector")
+print("  MECP_seam_normal_cart")
+print("  reaction_direction_cart")
+print("  GRADIENT_GAP_NORM_EH_PER_BOHR")
+print("  gradient_gap_magnitude")
+print("  CARTESIAN_GEOMETRIC_MEAN_GRADIENT_EH_PER_BOHR")
+print("  cartesian_geometric_mean_gradient_Eh_per_Bohr")
+print("  effective_hessian_mix_coefficient")
+print("  gradient_dot_product")
+print("  intersection_type")
+
+print(
+    "\nPROJECTED_GRADIENT_MEAN_EH_PER_BOHR is intentionally "
+    "not defined in Step 4."
+)
+print(
+    "The projected value is calculated later from the selected "
+    "effective-Hessian reaction coordinate."
+)
+
+print("\nSTEP 4 COMPLETED SUCCESSFULLY.\n")
+
+
+#%% STEP 5. Local PC REFERENCE DATA + MECP HESSIAN JOBS
+
+import os
+import re
+import numpy as np
+from pathlib import Path
+
+print(r'''
+====================================================================
+ STEP 5 | LOCAL PC VERSION
+ Reference data and MECP Hessian generation
+====================================================================
+
+This step prepares the vibrational and rotational data required for the
+subsequent density-of-states and effective-Hessian calculations.
+
+Reference/reactant vibrational data are reused from the optimized
+minimum obtained in Step 1. MECP Hessians are generated using two local
+SurfCrossNumFreq jobs:
+
+  1. mult_main as the xyz multiplicity, with mult_other as the MECP partner
+  2. mult_other as the xyz multiplicity, with mult_main as the MECP partner
+
+No SSH, no SFTP, no PBS/qsub, and no bash submission files are used.
+
+The reviewed DFT header and all transferable ORCA percent blocks captured
+in Step 1 are reused for both SurfCrossNumFreq calculations. Therefore,
+user-added settings such as solvent, custom basis/ECP, grid, dispersion,
+and SCF blocks remain consistent with the minimum, interpolation, MECP,
+and Engrad calculations.
+
+The raw ORCA PES2 frequencies from SurfCrossNumFreq are stored only as
+diagnostics. The final crossing-point effective frequencies used in the
+rate calculations are generated later from the projected effective Hessian.
+''')
+
+hartree_to_cm = 219474.6313705
+
+# ============================================================
+# Required variables from Steps 1-4
+# ============================================================
+
+required_vars_step5 = [
+    "jobname", "MECP_geometry", "Reference_multiplicity", "minima_data",
+    "local_base", "remote_base", "method", "basis", "charge",
+    "mult_main", "mult_other", "nprocs", "maxcore_mb",
+    "submit_and_monitor_orca_job", "make_dft_pre_xyz",
+]
+
+for var in required_vars_step5:
+    if var not in globals():
+        raise RuntimeError(
+            f"Required variable '{var}' is missing. Run Local PC Steps 1-4 first."
+        )
+
+workflow_mode = "MECP_ONLY"
+RUN_MODE = globals().get("RUN_MODE", "LOCAL")
+
+if not isinstance(MECP_geometry, str) or not MECP_geometry.strip():
+    raise RuntimeError("MECP_geometry is empty. Run Step 1 first.")
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def section(title):
+    print("\n" + "=" * 72)
+    print(f" {title}")
+    print("=" * 72 + "\n")
+
+
+def subsection(title):
+    print("\n" + "-" * 72)
+    print(title)
+    print("-" * 72 + "\n")
+
+
+def write_local_text(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+def read_local_text_file(path):
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+
+def clean_method_for_frequency(method_text):
+    excluded = {"surfcrossopt", "surfcrossnumfreq", "numfreq", "freq", "opt", "engrad"}
+    tokens = str(method_text).split()
+    clean_tokens = [token for token in tokens if token.lower() not in excluded]
+    return " ".join(clean_tokens).strip()
+
+
+def extract_final_sp_energy_from_text(out_text, source_label="output"):
+    values = []
+    for line in out_text.splitlines():
+        if "FINAL SINGLE POINT ENERGY" in line:
+            try:
+                values.append(float(line.split()[-1]))
+            except Exception:
+                pass
+    if not values:
+        raise RuntimeError(f"Could not find FINAL SINGLE POINT ENERGY in {source_label}.")
+    return float(values[-1])
+
+
+def extract_symmetry_and_rot_constants_from_text(out_text, source_label="output"):
+    symmetry_number = None
+    rotational_constants_cm1 = None
+
+    for line in out_text.splitlines():
+        if "Symmetry Number" in line:
+            match = re.search(r"Symmetry Number:\s*([0-9]+)", line, re.IGNORECASE)
+            if match:
+                symmetry_number = int(match.group(1))
+
+        if "Rotational constants in cm-1" in line:
+            nums = re.findall(
+                r"[-+]?\d*\.\d+(?:[Ee][-+]?\d+)?|[-+]?\d+(?:[Ee][-+]?\d+)?",
+                line
+            )
+            if len(nums) >= 3:
+                rotational_constants_cm1 = np.array(
+                    [float(nums[-3]), float(nums[-2]), float(nums[-1])], dtype=float
+                )
+
+    if symmetry_number is None:
+        symmetry_number = 1
+
+    if rotational_constants_cm1 is None:
+        raise RuntimeError(f"Could not find rotational constants in {source_label}.")
+
+    return symmetry_number, rotational_constants_cm1
+
+
+def extract_orca_frequency_blocks_from_text(out_text, source_label="output"):
+    blocks = []
+    current = None
+
+    for raw_line in out_text.splitlines():
+        line = raw_line.strip()
+
+        if line.startswith("VIBRATIONAL FREQUENCIES"):
+            if current is not None and len(current["freqs"]) > 0:
+                blocks.append(current)
+            current = {"title": line, "freqs": []}
+            continue
+
+        if current is not None:
+            if line == "" or line.startswith("-") or line.startswith("Scaling factor"):
+                continue
+
+            parts = line.replace(":", " ").split()
+
+            if len(parts) >= 3 and parts[0].isdigit() and "cm**-1" in parts:
+                try:
+                    current["freqs"].append(float(parts[1]))
+                except Exception:
+                    pass
+                continue
+
+            if len(current["freqs"]) > 0 and (
+                line.startswith("NORMAL MODES")
+                or line.startswith("IR SPECTRUM")
+                or line.startswith("THERMOCHEMISTRY")
+                or line.startswith("ORCA TERMINATED")
+            ):
+                blocks.append(current)
+                current = None
+
+    if current is not None and len(current["freqs"]) > 0:
+        blocks.append(current)
+
+    for block in blocks:
+        freqs = np.array(block["freqs"], dtype=float)
+        block["freqs"] = freqs
+        block["imag"] = freqs[freqs < 0.0]
+        block["zero"] = freqs[np.isclose(freqs, 0.0, atol=1.0e-6)]
+        block["real"] = freqs[freqs > 0.0]
+
+    if not blocks:
+        raise RuntimeError(f"No vibrational frequency block found in {source_label}.")
+
+    return blocks
+
+
+def select_reference_frequency_block_from_text(out_text, source_label="reference output"):
+    blocks = extract_orca_frequency_blocks_from_text(out_text, source_label)
+
+    print("\nDetected reference/reactant frequency blocks:")
+    for idx, block in enumerate(blocks, start=1):
+        print(
+            f"  Block {idx}: {block['title']} | "
+            f"imag={len(block['imag'])}, zero={len(block['zero'])}, real={len(block['real'])}"
+        )
+
+    no_imag = [block for block in blocks if len(block["imag"]) == 0]
+    if no_imag:
+        return max(no_imag, key=lambda block: len(block["real"]))
+
+    print("WARNING: Reference has imaginary frequencies.")
+    print("Using the frequency block with the fewest imaginary modes.")
+    return sorted(blocks, key=lambda block: (len(block["imag"]), -len(block["real"])))[0]
+
+
+def select_mecp_pes2_frequency_block_from_text(out_text, source_label="MECP output"):
+    blocks = extract_orca_frequency_blocks_from_text(out_text, source_label)
+
+    print(f"\nDetected MECP frequency blocks in {source_label}:")
+    for idx, block in enumerate(blocks, start=1):
+        print(
+            f"  Block {idx}: {block['title']} | "
+            f"imag={len(block['imag'])}, zero={len(block['zero'])}, real={len(block['real'])}"
+        )
+
+    pes2_blocks = [block for block in blocks if "PES2" in block["title"].upper()]
+    if not pes2_blocks:
+        raise RuntimeError(f"No PES2 frequency block found in {source_label}.")
+
+    pes2_no_imag = [block for block in pes2_blocks if len(block["imag"]) == 0]
+    if pes2_no_imag:
+        return max(pes2_no_imag, key=lambda block: len(block["real"]))
+
+    print("WARNING: PES2 block has imaginary frequencies.")
+    print("Keeping the PES2 block with the fewest imaginary modes as diagnostic.")
+    return sorted(pes2_blocks, key=lambda block: (len(block["imag"]), -len(block["real"])))[0]
+
+
+def zpe_from_freqs_cm1(freqs_cm1):
+    freqs = np.asarray(freqs_cm1, dtype=float)
+    freqs = freqs[np.isfinite(freqs) & (freqs > 0.0)]
+    return 0.5 * float(np.sum(freqs))
+
+
+def build_mecp_freq_input(geom_text, xyz_mult, mecp_mult):
+    """
+    Build the SurfCrossNumFreq input using the reviewed Step 1 DFT
+    settings and all transferable ORCA percent blocks.
+    """
+
+    mecp_block = f"""%mecp Mult {int(mecp_mult)}
+end
+"""
+
+    pre_xyz = make_dft_pre_xyz(
+        "freq",
+        job_specific_blocks=mecp_block
+    )
+
+    return build_orca_input_from_pre_xyz(
+        pre_xyz,
+        charge,
+        xyz_mult,
+        geom_text
+    )
+
+
+def local_find_file(local_dir, filename):
+    path = Path(local_dir) / filename
+    if path.exists():
+        return str(path)
+    raise RuntimeError(f"Required local file was not found:\n{path}")
+
+
+def local_file_exists(path):
+    return Path(path).exists()
+
+
+# ============================================================
+# Reference/reactant data from Step 1
+# ============================================================
+
+section("REFERENCE DATA FROM STEP 1")
+
+ref_data = minima_data[Reference_multiplicity]
+
+Reference_geometry = ref_data["geometry"]
+Reference_source = globals().get(
+    "Reference_source",
+    f"Reference minimum from Step 1, multiplicity {Reference_multiplicity}"
+)
+
+if "Electronic_Eh" in ref_data:
+    Ele_REF_hartree = float(ref_data["Electronic_Eh"])
+elif "Ele_hartree" in ref_data:
+    Ele_REF_hartree = float(ref_data["Ele_hartree"])
+else:
+    raise RuntimeError("Could not find reference electronic energy in minima_data.")
+
+if "ZPE_Eh" in ref_data:
+    ZPE_REF_thermo_hartree = float(ref_data["ZPE_Eh"])
+elif "ZPE_hartree" in ref_data:
+    ZPE_REF_thermo_hartree = float(ref_data["ZPE_hartree"])
+else:
+    raise RuntimeError("Could not find reference ZPE in minima_data.")
+
+E_ref_hartree = Ele_REF_hartree
+ZPE_REF_hartree = ZPE_REF_thermo_hartree
+ZPE_ref_hartree = ZPE_REF_thermo_hartree
+
+local_ref_out = ref_data["out_path"]
+local_ref_xyz = ref_data["xyz_path"]
+
+ref_out_text = read_local_text_file(local_ref_out)
+
+Reference_symmetry_number, Reference_rot_constants_cm1 = extract_symmetry_and_rot_constants_from_text(
+    ref_out_text, source_label=local_ref_out
+)
+
+ref_block = select_reference_frequency_block_from_text(ref_out_text, source_label=local_ref_out)
+
+freq_reactant_cm1_all = ref_block["freqs"]
+freq_reactant_real_cm1 = ref_block["real"]
+freq_reactant_imag_cm1 = ref_block["imag"]
+freq_reactant_zero_cm1 = ref_block["zero"]
+
+ZPE_REF_from_freq_cm1 = zpe_from_freqs_cm1(freq_reactant_real_cm1)
+ZPE_REF_from_freq_hartree = ZPE_REF_from_freq_cm1 / hartree_to_cm
+ZPE_REF_freq_hartree = ZPE_REF_from_freq_hartree
+
+print("\nReference/reactant data reused from Step 1:")
+print(f"  Reference source                 = {Reference_source}")
+print(f"  Reference multiplicity           = {Reference_multiplicity}")
+print(f"  Reference out                    = {local_ref_out}")
+print(f"  Reference xyz                    = {local_ref_xyz}")
+print(f"  Ele_REF_hartree                  = {Ele_REF_hartree:.12f}")
+print(f"  ZPE_REF_thermo_hartree           = {ZPE_REF_thermo_hartree:.12f}")
+print(f"  ZPE_REF_from_freq_cm1            = {ZPE_REF_from_freq_cm1:.6f}")
+print(f"  ZPE_REF_from_freq_hartree        = {ZPE_REF_from_freq_hartree:.12f}")
+print(f"  Reference real frequencies       = {len(freq_reactant_real_cm1)}")
+print(f"  Reference imaginary frequencies  = {len(freq_reactant_imag_cm1)}")
+print(f"  Reference symmetry number        = {Reference_symmetry_number}")
+print(f"  Reference rot constants cm^-1    = {Reference_rot_constants_cm1}")
+
+if len(freq_reactant_imag_cm1) > 0:
+    print("\nWARNING: Reference/reactant has imaginary frequencies:")
+    print(freq_reactant_imag_cm1)
+
+# ============================================================
+# Local frequency directory
+# ============================================================
+
+section("MECP FREQUENCY DIRECTORY PREPARATION")
+
+local_hess_dir = os.path.join(local_base, "Frequencies")
+os.makedirs(local_hess_dir, exist_ok=True)
+remote_hess_dir = local_hess_dir
+
+print(f"Local Hessian/frequency directory  : {local_hess_dir}")
+print(f"remote_hess_dir local alias        : {remote_hess_dir}")
+print("Reference frequency data are reused from Step 1.")
+print("Only the two MECP SurfCrossNumFreq jobs are generated here.")
+print("Reviewed Step 1 DFT header and transferable % blocks are reused.")
+
+freq_mecp_main_other_label = f"{jobname}_Freq_MECP_main_other"
+freq_mecp_other_main_label = f"{jobname}_Freq_MECP_other_main"
+
+# ============================================================
+# Build and run two MECP SurfCrossNumFreq jobs locally
+# ============================================================
+
+section("RUNNING MECP SURFCROSSNUMFREQ JOBS")
+
+mecp_main_other_inp = build_mecp_freq_input(MECP_geometry, xyz_mult=mult_main, mecp_mult=mult_other)
+mecp_other_main_inp = build_mecp_freq_input(MECP_geometry, xyz_mult=mult_other, mecp_mult=mult_main)
+
+freq_jobs = [
+    {
+        "jobname": freq_mecp_main_other_label,
+        "inp_text": mecp_main_other_inp,
+        "job_label": f"MECP SurfCrossNumFreq: xyz mult {mult_main}, partner mult {mult_other}",
+        "xyz_mult": mult_main,
+        "mecp_mult": mult_other
+    },
+    {
+        "jobname": freq_mecp_other_main_label,
+        "inp_text": mecp_other_main_inp,
+        "job_label": f"MECP SurfCrossNumFreq: xyz mult {mult_other}, partner mult {mult_main}",
+        "xyz_mult": mult_other,
+        "mecp_mult": mult_main
+    }
+]
+
+for job in freq_jobs:
+    local_inp = os.path.join(local_hess_dir, f"{job['jobname']}.inp")
+    write_local_text(local_inp, job["inp_text"])
+    subsection(f"Generated ORCA input | {job['jobname']}.inp")
+    print(job["inp_text"])
+
+submitted_freq_jobs = []
+
+for job in freq_jobs:
+    status, final_inp = submit_and_monitor_orca_job(
+        remote_dir=local_hess_dir,
+        jobname_i=job["jobname"],
+        inp_text=job["inp_text"],
+        job_label=job["job_label"],
+        allow_interactive_repair=True,
+        repair_policy="freq_restricted",
+        locked={
+            "method": clean_method_for_frequency(method),
+            "basis": basis,
+            "charge": charge,
+            "mult": job["xyz_mult"],
+            "mecp_mult": job["mecp_mult"],
+            "geom": MECP_geometry,
+        }
+    )
+
+    rec = {
+        "jobname": job["jobname"],
+        "job_label": job["job_label"],
+        "status": status,
+        "short_id": "LOCAL",
+        "inp_text": final_inp,
+        "attempt": 1,
+        "xyz_mult": job["xyz_mult"],
+        "mecp_mult": job["mecp_mult"],
+        "repair_policy": "freq_restricted",
+        "locked": {
+            "method": clean_method_for_frequency(method),
+            "basis": basis,
+            "charge": charge,
+            "mult": job["xyz_mult"],
+            "mecp_mult": job["mecp_mult"],
+            "geom": MECP_geometry,
+        }
+    }
+    write_local_text(os.path.join(local_hess_dir, f"{job['jobname']}.inp"), final_inp)
+    submitted_freq_jobs.append(rec)
+
+print("\nBoth MECP SurfCrossNumFreq jobs have been run and checked locally.\n")
+
+for rec in submitted_freq_jobs:
+    if rec["status"] != "OK":
+        raise SystemExit(f"{rec['jobname']} did not complete successfully.")
+
+# ============================================================
+# MECP Hessian paths and diagnostic PES2 frequencies
+# ============================================================
+
+section("MECP HESSIAN AND FREQUENCY EXTRACTION")
+
+local_mecp_main_other_out = local_find_file(local_hess_dir, f"{freq_mecp_main_other_label}.out")
+local_mecp_other_main_out = local_find_file(local_hess_dir, f"{freq_mecp_other_main_label}.out")
+local_mecp_main_other_hess = local_find_file(local_hess_dir, f"{freq_mecp_main_other_label}.hess")
+local_mecp_other_main_hess = local_find_file(local_hess_dir, f"{freq_mecp_other_main_label}.hess")
+
+mecp_main_other_out_text = read_local_text_file(local_mecp_main_other_out)
+mecp_other_main_out_text = read_local_text_file(local_mecp_other_main_out)
+
+MECP_symmetry_number, MECP_rot_constants_cm1 = extract_symmetry_and_rot_constants_from_text(
+    mecp_main_other_out_text, source_label=local_mecp_main_other_out
+)
+
+mecp_pes2_block = select_mecp_pes2_frequency_block_from_text(
+    mecp_main_other_out_text, source_label=local_mecp_main_other_out
+)
+
+freq_MECP_PES2_cm1_all = mecp_pes2_block["freqs"]
+freq_MECP_PES2_real_cm1 = mecp_pes2_block["real"]
+freq_MECP_PES2_imag_cm1 = mecp_pes2_block["imag"]
+freq_MECP_PES2_zero_cm1 = mecp_pes2_block["zero"]
+
+freq_MECP_PES2_real_cm1_diagnostic = freq_MECP_PES2_real_cm1
+freq_MECP_PES2_imag_cm1_diagnostic = freq_MECP_PES2_imag_cm1
+freq_MECP_PES2_zero_cm1_diagnostic = freq_MECP_PES2_zero_cm1
+
+remote_mecp_main_other_out = local_mecp_main_other_out
+remote_mecp_other_main_out = local_mecp_other_main_out
+remote_mecp_main_other_hess = local_mecp_main_other_hess
+remote_mecp_other_main_hess = local_mecp_other_main_hess
+remote_freq_mecp_out = remote_mecp_main_other_out
+remote_freq_mecp_hess = remote_mecp_main_other_hess
+
+local_freq_mecp_out = os.path.join(local_hess_dir, "Freq_MECP.out")
+local_freq_mecp_hess = os.path.join(local_hess_dir, "Freq_MECP.hess")
+write_local_text(local_freq_mecp_out, mecp_main_other_out_text)
+with open(local_mecp_main_other_hess, "r", encoding="utf-8", errors="ignore") as src:
+    write_local_text(local_freq_mecp_hess, src.read())
+
+print("\nMECP Hessian jobs completed:")
+print(f"  main/other output              = {local_mecp_main_other_out}")
+print(f"  main/other hessian             = {local_mecp_main_other_hess}")
+print(f"  other/main output              = {local_mecp_other_main_out}")
+print(f"  other/main hessian             = {local_mecp_other_main_hess}")
+print(f"  MECP symmetry number           = {MECP_symmetry_number}")
+print(f"  MECP rot constants cm^-1       = {MECP_rot_constants_cm1}")
+print("\nDiagnostic ORCA PES2 frequencies from SurfCrossNumFreq:")
+print(f"  block                          = {mecp_pes2_block['title']}")
+print(f"  real                           = {len(freq_MECP_PES2_real_cm1_diagnostic)}")
+print(f"  imag                           = {len(freq_MECP_PES2_imag_cm1_diagnostic)}")
+print(
+    "  NOTE: The final crossing-point frequencies must come from "
+    "the Step 6 projected effective Hessian."
+)
+
+# ============================================================
+# Electronic barrier bookkeeping
+# ============================================================
+
+section("ELECTRONIC BARRIER BOOKKEEPING")
+
+local_mecp_optimization_out = None
+if "local_mecp" in globals():
+    candidate = os.path.join(local_mecp, f"{jobname}.out")
+    if local_file_exists(candidate):
+        local_mecp_optimization_out = candidate
+elif "remote_mecp" in globals():
+    candidate = os.path.join(str(remote_mecp), f"{jobname}.out")
+    if local_file_exists(candidate):
+        local_mecp_optimization_out = candidate
+
+if local_mecp_optimization_out is not None:
+    mecp_opt_text = read_local_text_file(local_mecp_optimization_out)
+    Ele_MECP_hartree = extract_final_sp_energy_from_text(
+        mecp_opt_text, source_label=local_mecp_optimization_out
+    )
+    MECP_energy_source = local_mecp_optimization_out
+else:
+    Ele_MECP_hartree = extract_final_sp_energy_from_text(
+        mecp_main_other_out_text, source_label=local_mecp_main_other_out
+    )
+    MECP_energy_source = local_mecp_main_other_out
+
+E_MECP_electronic_hartree = Ele_MECP_hartree - Ele_REF_hartree
+VaG_MECP_electronic_cm1 = E_MECP_electronic_hartree * hartree_to_cm
+
+VaG_MECP_cm1 = VaG_MECP_electronic_cm1
+VaG_MECP_kJmol = VaG_MECP_cm1 * 0.01196266
+E_MECP = VaG_MECP_cm1
+E_MECP_cm1 = VaG_MECP_cm1
+
+print(f"Reference electronic energy       = {Ele_REF_hartree:.12f} Eh")
+print(f"MECP electronic energy source     = {MECP_energy_source}")
+print(f"MECP electronic energy            = {Ele_MECP_hartree:.12f} Eh")
+print(f"Electronic MECP barrier           = {VaG_MECP_electronic_cm1:.6f} cm^-1")
+print(f"Provisional active barrier        = {VaG_MECP_cm1:.6f} cm^-1")
+print("NOTE: Step 6/7 should replace this with effective-Hessian ZPE correction.")
+
+# ============================================================
+# Downstream variable preparation
+# ============================================================
+
+section("DOWNSTREAM VARIABLE PREPARATION")
+
+reference_symmetry_factor = float(
+    Reference_symmetry_number
+)
+crossing_symmetry_factor = float(
+    MECP_symmetry_number
+)
+
+MECP_hess_main_other_path = local_mecp_main_other_hess
+MECP_hess_other_main_path = local_mecp_other_main_hess
+MECP_hess_main_other_remote = remote_mecp_main_other_hess
+MECP_hess_other_main_remote = remote_mecp_other_main_hess
+
+MECP_out_main_other_path = local_mecp_main_other_out
+MECP_out_other_main_path = local_mecp_other_main_out
+MECP_out_main_other_remote = remote_mecp_main_other_out
+MECP_out_other_main_remote = remote_mecp_other_main_out
+
+MECP_mult_main = mult_main
+MECP_mult_other = mult_other
+
+reference_vibrational_frequencies_cm1 = np.asarray(
+    freq_reactant_real_cm1,
+    dtype=float
+).reshape(-1)
+
+reference_rotational_constants_cm1 = np.asarray(
+    Reference_rot_constants_cm1,
+    dtype=float
+).reshape(-1)
+
+crossing_rotational_constants_cm1 = np.asarray(
+    MECP_rot_constants_cm1,
+    dtype=float
+).reshape(-1)
+
+print("Prepared downstream variables:")
+print("  reference_vibrational_frequencies_cm1")
+print("  reference_rotational_constants_cm1")
+print("  crossing_rotational_constants_cm1")
+print("  reference_symmetry_factor")
+print("  crossing_symmetry_factor")
+print("  MECP_hess_main_other_path")
+print("  MECP_hess_other_main_path")
+
+# ============================================================
+# Save Step 5 metadata
+# ============================================================
+
+section("SAVING STEP 5 OUTPUTS")
+
+rot_info_file = os.path.join(local_hess_dir, "rotational_constants_and_symmetry.txt")
+
+rot_lines = []
+rot_lines.append("Rotational constants and symmetry numbers")
+rot_lines.append("Reference data reused from Step 1 minimum Opt Freq output")
+rot_lines.append("MECP data from SurfCrossNumFreq output")
+rot_lines.append("SurfCrossNumFreq inputs reuse the reviewed Step 1 DFT header and transferable percent blocks")
+rot_lines.append("")
+rot_lines.append("[REFERENCE]")
+rot_lines.append(f"output_file = {local_ref_out}")
+rot_lines.append(f"xyz_file = {local_ref_xyz}")
+rot_lines.append(f"multiplicity = {Reference_multiplicity}")
+rot_lines.append(f"symmetry_number = {Reference_symmetry_number}")
+rot_lines.append("rotational_constants_cm1 = " + " ".join(f"{x:.12f}" for x in Reference_rot_constants_cm1))
+rot_lines.append("")
+rot_lines.append("[MECP_MAIN_OTHER]")
+rot_lines.append(f"output_file = {local_mecp_main_other_out}")
+rot_lines.append(f"hessian_file = {local_mecp_main_other_hess}")
+rot_lines.append(f"xyz_multiplicity = {mult_main}")
+rot_lines.append(f"mecp_multiplicity = {mult_other}")
+rot_lines.append(f"symmetry_number = {MECP_symmetry_number}")
+rot_lines.append("rotational_constants_cm1 = " + " ".join(f"{x:.12f}" for x in MECP_rot_constants_cm1))
+rot_lines.append("")
+rot_lines.append("[MECP_OTHER_MAIN]")
+rot_lines.append(f"output_file = {local_mecp_other_main_out}")
+rot_lines.append(f"hessian_file = {local_mecp_other_main_hess}")
+rot_lines.append(f"xyz_multiplicity = {mult_other}")
+rot_lines.append(f"mecp_multiplicity = {mult_main}")
+rot_lines.append("")
+rot_lines.append("[BARRIER]")
+rot_lines.append(f"Ele_REF_hartree = {Ele_REF_hartree:.12f}")
+rot_lines.append(f"Ele_MECP_hartree = {Ele_MECP_hartree:.12f}")
+rot_lines.append(f"MECP_energy_source = {MECP_energy_source}")
+rot_lines.append(f"VaG_MECP_electronic_cm1 = {VaG_MECP_electronic_cm1:.12f}")
+rot_lines.append(f"VaG_MECP_cm1_provisional = {VaG_MECP_cm1:.12f}")
+rot_lines.append("")
+rot_lines.append("[REFERENCE_FREQUENCIES]")
+rot_lines.append(f"real_count = {len(freq_reactant_real_cm1)}")
+rot_lines.append(f"imag_count = {len(freq_reactant_imag_cm1)}")
+rot_lines.append(f"zero_count = {len(freq_reactant_zero_cm1)}")
+rot_lines.append(f"ZPE_REF_from_freq_cm1 = {ZPE_REF_from_freq_cm1:.12f}")
+rot_lines.append(f"ZPE_REF_from_freq_hartree = {ZPE_REF_from_freq_hartree:.12f}")
+rot_lines.append("")
+rot_lines.append("[MECP_PES2_DIAGNOSTIC_FREQUENCIES]")
+rot_lines.append(f"block = {mecp_pes2_block['title']}")
+rot_lines.append(f"real_count = {len(freq_MECP_PES2_real_cm1_diagnostic)}")
+rot_lines.append(f"imag_count = {len(freq_MECP_PES2_imag_cm1_diagnostic)}")
+rot_lines.append(f"zero_count = {len(freq_MECP_PES2_zero_cm1_diagnostic)}")
+rot_lines.append("NOTE = Diagnostic only. Step 6 projected effective Hessian defines the final crossing-point frequencies.")
+
+write_local_text(rot_info_file, "\n".join(rot_lines) + "\n")
+remote_rot_info_file = rot_info_file
+
+try:
+    ref_copy = os.path.join(local_hess_dir, "Reference_minimum.out")
+    write_local_text(ref_copy, ref_out_text)
+except Exception:
+    pass
+
+# ============================================================
+# Export variables
+# ============================================================
+
+globals().update({
+    "hartree_to_cm": hartree_to_cm,
+    "workflow_mode": workflow_mode,
+    "remote_hess_dir": remote_hess_dir,
+    "local_hess_dir": local_hess_dir,
+    "Reference_geometry": Reference_geometry,
+    "Reference_source": Reference_source,
+    "Ele_REF_hartree": Ele_REF_hartree,
+    "E_ref_hartree": E_ref_hartree,
+    "ZPE_REF_thermo_hartree": ZPE_REF_thermo_hartree,
+    "ZPE_REF_hartree": ZPE_REF_hartree,
+    "ZPE_ref_hartree": ZPE_ref_hartree,
+    "ZPE_REF_from_freq_cm1": ZPE_REF_from_freq_cm1,
+    "ZPE_REF_from_freq_hartree": ZPE_REF_from_freq_hartree,
+    "ZPE_REF_freq_hartree": ZPE_REF_freq_hartree,
+    "freq_reactant_cm1_all": freq_reactant_cm1_all,
+    "freq_reactant_real_cm1": freq_reactant_real_cm1,
+    "freq_reactant_imag_cm1": freq_reactant_imag_cm1,
+    "freq_reactant_zero_cm1": freq_reactant_zero_cm1,
+    "reference_vibrational_frequencies_cm1": reference_vibrational_frequencies_cm1,
+    "Reference_symmetry_number": Reference_symmetry_number,
+    "Reference_rot_constants_cm1": Reference_rot_constants_cm1,
+    "MECP_symmetry_number": MECP_symmetry_number,
+    "MECP_rot_constants_cm1": MECP_rot_constants_cm1,
+    "reference_symmetry_factor": reference_symmetry_factor,
+    "crossing_symmetry_factor": crossing_symmetry_factor,
+    "freq_MECP_PES2_cm1_all": freq_MECP_PES2_cm1_all,
+    "freq_MECP_PES2_real_cm1": freq_MECP_PES2_real_cm1,
+    "freq_MECP_PES2_imag_cm1": freq_MECP_PES2_imag_cm1,
+    "freq_MECP_PES2_zero_cm1": freq_MECP_PES2_zero_cm1,
+    "freq_MECP_PES2_real_cm1_diagnostic": freq_MECP_PES2_real_cm1_diagnostic,
+    "freq_MECP_PES2_imag_cm1_diagnostic": freq_MECP_PES2_imag_cm1_diagnostic,
+    "freq_MECP_PES2_zero_cm1_diagnostic": freq_MECP_PES2_zero_cm1_diagnostic,
+    "Ele_MECP_hartree": Ele_MECP_hartree,
+    "E_MECP_electronic_hartree": E_MECP_electronic_hartree,
+    "VaG_MECP_electronic_cm1": VaG_MECP_electronic_cm1,
+    "VaG_MECP_cm1": VaG_MECP_cm1,
+    "VaG_MECP_kJmol": VaG_MECP_kJmol,
+    "E_MECP": E_MECP,
+    "E_MECP_cm1": E_MECP_cm1,
+    "MECP_energy_source": MECP_energy_source,
+    "MECP_hess_main_other_path": MECP_hess_main_other_path,
+    "MECP_hess_other_main_path": MECP_hess_other_main_path,
+    "MECP_hess_main_other_remote": MECP_hess_main_other_remote,
+    "MECP_hess_other_main_remote": MECP_hess_other_main_remote,
+    "MECP_out_main_other_path": MECP_out_main_other_path,
+    "MECP_out_other_main_path": MECP_out_other_main_path,
+    "MECP_out_main_other_remote": MECP_out_main_other_remote,
+    "MECP_out_other_main_remote": MECP_out_other_main_remote,
+    "MECP_mult_main": MECP_mult_main,
+    "MECP_mult_other": MECP_mult_other,
+    "reference_rotational_constants_cm1": reference_rotational_constants_cm1,
+    "crossing_rotational_constants_cm1": crossing_rotational_constants_cm1,
+    "rot_info_file": rot_info_file,
+    "remote_rot_info_file": remote_rot_info_file,
+    "freq_job_records": submitted_freq_jobs,
+    "mecp_main_other_inp": mecp_main_other_inp,
+    "mecp_other_main_inp": mecp_other_main_inp,
+})
+
+# ============================================================
+# Final summary
+# ============================================================
+
+section("STEP 5 SUMMARY")
+
+print(f"Reference multiplicity              : {Reference_multiplicity}")
+print(f"Reference real frequencies          : {len(freq_reactant_real_cm1)}")
+print(f"Reference symmetry number           : {Reference_symmetry_number}")
+print(f"MECP symmetry number                : {MECP_symmetry_number}")
+print(f"Electronic MECP barrier             : {VaG_MECP_electronic_cm1:.6f} cm^-1")
+print(f"Provisional active barrier          : {VaG_MECP_cm1:.6f} cm^-1")
+print(f"Local Hessian directory             : {local_hess_dir}")
+print(f"remote_hess_dir local alias         : {remote_hess_dir}")
+print(f"Rotational/symmetry metadata local  : {rot_info_file}")
+print(f"Rotational/symmetry metadata alias  : {remote_rot_info_file}")
+print("SurfCrossNumFreq DFT settings       : propagated from reviewed Step 1 input")
+
+print("\nAvailable Step 5 variables:")
+print("  reference_vibrational_frequencies_cm1")
+print("  reference_vibrational_frequencies_cm1")
+print("  freq_reactant_real_cm1")
+print("  freq_reactant_imag_cm1")
+print("  reference_rotational_constants_cm1")
+print("  Reference_rot_constants_cm1")
+print("  crossing_rotational_constants_cm1")
+print("  MECP_rot_constants_cm1")
+print("  Reference_symmetry_number")
+print("  MECP_symmetry_number")
+print("  Ele_REF_hartree")
+print("  ZPE_REF_thermo_hartree")
+print("  ZPE_REF_from_freq_cm1")
+print("  ZPE_REF_freq_hartree")
+print("  Ele_MECP_hartree")
+print("  VaG_MECP_electronic_cm1")
+print("  VaG_MECP_cm1                  # provisional electronic barrier only")
+print("  freq_MECP_PES2_real_cm1_diagnostic")
+print("  MECP_hess_main_other_path")
+print("  MECP_hess_other_main_path")
+print("  MECP_hess_main_other_remote")
+print("  MECP_hess_other_main_remote")
+print("  reference_symmetry_factor")
+print("  crossing_symmetry_factor")
+print("  rot_info_file")
+
+print("\nSTEP 5 COMPLETED SUCCESSFULLY.\n")
+
+
+#%% STEP 6. Local PC EFFECTIVE-HESSIAN REACTION COORDINATE AND REDUCED MASS
+
+import os
+import re
+import numpy as np
+from scipy.linalg import orth
+
+print(r'''
+====================================================================
+ STEP 6 | LOCAL PC VERSION
+ Effective Hessian, reaction coordinate, and reduced mass
+====================================================================
+
+This step uses the two local MECP SurfCrossNumFreq Hessians generated in
+Local PC Step 5 and the two MECP gradients generated in Step 3.
+
+No new ORCA calculation is performed here. No SSH, SFTP, PBS/qsub,
+or bash submission files are used.
+
+The main tasks are:
+
+  1. Read the two ORCA .hess files.
+  2. Construct mass-weighted Hessians.
+  3. Build the selected effective Hessian.
+  4. Remove translation, rotation, and the reaction-coordinate direction.
+  5. Extract transverse crossing-point frequencies.
+  6. Define the reaction-coordinate reduced mass.
+
+The final downstream quantities are:
+
+  GRADIENT_GAP_NORM_EH_PER_BOHR
+  PROJECTED_GRADIENT_MEAN_EH_PER_BOHR
+  reduced_mass_amu
+  freq_MECP_effhess_real_cm1
+  reaction_direction_hessian_cart
+  reaction_direction_hessian_mw
+''')
+
+# ============================================================
+# Required variables from Steps 1–5
+# ============================================================
+
+required_vars_step6 = [
+    "jobname",
+    "MECP_geometry",
+    "g_LS",
+    "g_HS",
+    "mult_LS",
+    "mult_HS",
+    "spin_name_LS",
+    "spin_name_HS",
+    "MECP_hess_main_other_path",
+    "MECP_hess_other_main_path",
+    "local_base",
+    "remote_base"
+]
+
+for var in required_vars_step6:
+    if var not in globals():
+        raise RuntimeError(
+            f"Required variable '{var}' is missing. Run Local PC Steps 1–5 first."
+        )
+
+RUN_MODE = globals().get("RUN_MODE", "LOCAL")
+workflow_mode = "MECP_ONLY"
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def section(title):
+    print("\n" + "=" * 72)
+    print(f" {title}")
+    print("=" * 72 + "\n")
+
+
+def subsection(title):
+    print("\n" + "-" * 72)
+    print(title)
+    print("-" * 72 + "\n")
+
+
+def write_local_text(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+def normalize_vector(v, label):
+    v = np.asarray(v, dtype=float).reshape(-1)
+    nrm = float(np.linalg.norm(v))
+
+    if not np.isfinite(nrm) or nrm <= 0.0:
+        raise RuntimeError(f"Invalid vector norm for {label}.")
+
+    return v / nrm
+
+
+def atomic_contribution_from_vector(k_cart_like, symbols):
+    atom_contrib = []
+
+    for a, sym in enumerate(symbols):
+        idx = 3 * a
+        amp = float(np.linalg.norm(k_cart_like[idx:idx + 3]))
+        atom_contrib.append((a + 1, sym, amp))
+
+    atom_contrib.sort(key=lambda x: x[2], reverse=True)
+    return atom_contrib
+
+
+# ============================================================
+# Atomic masses
+# ============================================================
+
+atomic_masses = {
+    "H": 1.008,
+    "D": 2.014,
+    "B": 10.81,
+    "C": 12.011,
+    "N": 14.007,
+    "O": 15.999,
+    "F": 18.998403163,
+    "Na": 22.98976928,
+    "Mg": 24.305,
+    "Al": 26.9815385,
+    "Si": 28.085,
+    "P": 30.973761998,
+    "S": 32.06,
+    "Cl": 35.45,
+    "K": 39.0983,
+    "Ca": 40.078,
+    "Sc": 44.955908,
+    "Ti": 47.867,
+    "V": 50.9415,
+    "Cr": 51.9961,
+    "Mn": 54.938044,
+    "Fe": 55.845,
+    "Co": 58.933194,
+    "Ni": 58.6934,
+    "Cu": 63.546,
+    "Zn": 65.38,
+    "Ga": 69.723,
+    "Ge": 72.630,
+    "As": 74.921595,
+    "Se": 78.971,
+    "Br": 79.904,
+    "Rb": 85.4678,
+    "Sr": 87.62,
+    "Y": 88.90584,
+    "Zr": 91.224,
+    "Nb": 92.90637,
+    "Mo": 95.95,
+    "Tc": 98.0,
+    "Ru": 101.07,
+    "Rh": 102.90550,
+    "Pd": 106.42,
+    "Ag": 107.8682,
+    "Cd": 112.414,
+    "In": 114.818,
+    "Sn": 118.710,
+    "Sb": 121.760,
+    "Te": 127.60,
+    "I": 126.90447,
+    "Cs": 132.90545196,
+    "Ba": 137.327,
+    "La": 138.90547,
+    "Hf": 178.49,
+    "Ta": 180.94788,
+    "W": 183.84,
+    "Re": 186.207,
+    "Os": 190.23,
+    "Ir": 192.217,
+    "Pt": 195.084,
+    "Au": 196.966569,
+    "Hg": 200.592
+}
+
+# ============================================================
+# Geometry parsing
+# ============================================================
+
+section("MECP GEOMETRY AND MASS PREPARATION")
+
+symbols_mecp = []
+coords_mecp = []
+
+for line in MECP_geometry.splitlines():
+    parts = line.split()
+
+    if len(parts) >= 4:
+        sym = parts[0]
+        sym = re.sub(r"[^A-Za-z]", "", sym)
+        sym = sym[0].upper() + sym[1:].lower()
+
+        symbols_mecp.append(sym)
+        coords_mecp.append([
+            float(parts[1]),
+            float(parts[2]),
+            float(parts[3])
+        ])
+
+if not symbols_mecp:
+    raise RuntimeError("Could not parse MECP_geometry.")
+
+missing_masses = sorted(set([s for s in symbols_mecp if s not in atomic_masses]))
+
+if missing_masses:
+    raise RuntimeError(
+        "Missing atomic masses for: "
+        + ", ".join(missing_masses)
+    )
+
+coords_mecp = np.asarray(coords_mecp, dtype=float)
+masses = np.asarray([atomic_masses[s] for s in symbols_mecp], dtype=float)
+
+natoms = len(symbols_mecp)
+num_cart = 3 * natoms
+
+mass_vector = np.repeat(masses, 3)
+sqrt_mass_vector = np.sqrt(mass_vector)
+
+print(f"Number of atoms              : {natoms}")
+print(f"Cartesian dimension          : {num_cart}")
+print(f"Total mass                   : {np.sum(masses):.8f} amu")
+
+# ============================================================
+# Gradient and force definitions
+# ============================================================
+
+section("GRADIENT AND FORCE DEFINITIONS")
+
+g_LS = np.asarray(g_LS, dtype=float).reshape(-1)
+g_HS = np.asarray(g_HS, dtype=float).reshape(-1)
+
+if g_LS.size != num_cart:
+    raise RuntimeError(
+        f"g_LS length {g_LS.size} does not match 3N = {num_cart}."
+    )
+
+if g_HS.size != num_cart:
+    raise RuntimeError(
+        f"g_HS length {g_HS.size} does not match 3N = {num_cart}."
+    )
+
+g_LS_norm_Eh_per_Bohr = float(np.linalg.norm(g_LS))
+g_HS_norm_Eh_per_Bohr = float(np.linalg.norm(g_HS))
+gradient_dot_product = float(np.dot(g_LS, g_HS))
+
+if (
+    g_LS_norm_Eh_per_Bohr <= 0.0
+    or g_HS_norm_Eh_per_Bohr <= 0.0
+):
+    raise RuntimeError("Invalid MECP gradient norm.")
+
+surface_gradient_difference_cart = g_LS - g_HS
+reverse_surface_gradient_difference_cart = g_HS - g_LS
+surface_gradient_sum_cart = g_HS + g_LS
+
+gradient_gap_norm_Eh_per_Bohr = float(
+    np.linalg.norm(surface_gradient_difference_cart)
+)
+
+if (
+    not np.isfinite(gradient_gap_norm_Eh_per_Bohr)
+    or gradient_gap_norm_Eh_per_Bohr <= 0.0
+):
+    raise RuntimeError("Invalid surface-gradient difference norm.")
+
+GRADIENT_GAP_NORM_EH_PER_BOHR = gradient_gap_norm_Eh_per_Bohr
+gradient_gap_magnitude = GRADIENT_GAP_NORM_EH_PER_BOHR
+
+gradient_difference_unit_vector = (
+    surface_gradient_difference_cart
+    / gradient_gap_norm_Eh_per_Bohr
+)
+
+reverse_gradient_unit_vector = (
+    reverse_surface_gradient_difference_cart
+    / gradient_gap_norm_Eh_per_Bohr
+)
+
+reaction_direction_cart = reverse_gradient_unit_vector.copy()
+MECP_seam_normal_cart = reverse_gradient_unit_vector.copy()
+
+low_spin_projected_gradient_signed = float(
+    np.dot(g_LS, reaction_direction_cart)
+)
+high_spin_projected_gradient_signed = float(
+    np.dot(g_HS, reaction_direction_cart)
+)
+
+low_spin_projected_gradient_magnitude = abs(
+    low_spin_projected_gradient_signed
+)
+high_spin_projected_gradient_magnitude = abs(
+    high_spin_projected_gradient_signed
+)
+
+PROJECTED_GRADIENT_MEAN_EH_PER_BOHR = float(
+    np.sqrt(
+        low_spin_projected_gradient_magnitude
+        * high_spin_projected_gradient_magnitude
+    )
+)
+
+projected_gradient_mean_Eh_per_Bohr = (
+    PROJECTED_GRADIENT_MEAN_EH_PER_BOHR
+)
+projected_gradient_mean = PROJECTED_GRADIENT_MEAN_EH_PER_BOHR
+
+inverse_gradient_direction_mass_amu_inv = float(
+    np.sum(
+        (reaction_direction_cart ** 2)
+        / mass_vector
+    )
+)
+reduced_mass_gradient_direction_amu = (
+    1.0 / inverse_gradient_direction_mass_amu_inv
+)
+
+intersection_type = (
+    "peaked"
+    if gradient_dot_product < 0.0
+    else "sloped"
+)
+
+print(
+    f"Low-spin surface                         : "
+    f"{spin_name_LS}, multiplicity {mult_LS}"
+)
+print(
+    f"High-spin surface                        : "
+    f"{spin_name_HS}, multiplicity {mult_HS}"
+)
+print(
+    f"||g_LS||                                 : "
+    f"{g_LS_norm_Eh_per_Bohr:.12e} Eh/Bohr"
+)
+print(
+    f"||g_HS||                                 : "
+    f"{g_HS_norm_Eh_per_Bohr:.12e} Eh/Bohr"
+)
+print(
+    f"g_LS · g_HS                              : "
+    f"{gradient_dot_product:.12e}"
+)
+print(f"Intersection type                        : {intersection_type}")
+print(
+    f"GRADIENT_GAP_NORM_EH_PER_BOHR            : "
+    f"{GRADIENT_GAP_NORM_EH_PER_BOHR:.12e}"
+)
+print(
+    f"Low-spin projected gradient magnitude    : "
+    f"{low_spin_projected_gradient_magnitude:.12e}"
+)
+print(
+    f"High-spin projected gradient magnitude   : "
+    f"{high_spin_projected_gradient_magnitude:.12e}"
+)
+print(
+    f"PROJECTED_GRADIENT_MEAN_EH_PER_BOHR      : "
+    f"{PROJECTED_GRADIENT_MEAN_EH_PER_BOHR:.12e}"
+)
+print(
+    f"Cartesian gradient-direction reduced mass: "
+    f"{reduced_mass_gradient_direction_amu:.8f} amu"
+)
+
+# ============================================================
+# ORCA Hessian parser
+# ============================================================
+
+def read_orca_hessian(hess_path, expected_dim):
+    if not os.path.isfile(hess_path):
+        raise RuntimeError(f"Hessian file not found:\n{hess_path}")
+
+    try:
+        H_plain = np.loadtxt(hess_path)
+
+        if (
+            H_plain.ndim == 2
+            and H_plain.shape == (expected_dim, expected_dim)
+        ):
+            return 0.5 * (H_plain + H_plain.T)
+
+    except Exception:
+        pass
+
+    with open(hess_path, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+
+    start = None
+
+    for i, line in enumerate(lines):
+        if line.strip().lower().startswith("$hessian"):
+            start = i
+            break
+
+    if start is None:
+        raise RuntimeError(f"Could not find $hessian block in:\n{hess_path}")
+
+    dim = None
+    dim_line_index = None
+
+    for i in range(start + 1, len(lines)):
+        stripped = lines[i].strip()
+
+        if not stripped:
+            continue
+
+        if stripped.startswith("$"):
+            break
+
+        nums = re.findall(r"[-+]?\d+", stripped)
+
+        if nums:
+            dim = int(nums[0])
+            dim_line_index = i
+            break
+
+    if dim != expected_dim:
+        raise RuntimeError(
+            f"Hessian dimension {dim}, expected {expected_dim}, file:\n{hess_path}"
+        )
+
+    H = np.zeros((dim, dim), dtype=float)
+    i = dim_line_index + 1
+
+    while i < len(lines):
+        line = lines[i].strip()
+
+        if not line:
+            i += 1
+            continue
+
+        if line.startswith("$"):
+            break
+
+        header_ints = re.findall(r"[-+]?\d+", line)
+
+        if not header_ints:
+            i += 1
+            continue
+
+        col_indices = [int(x) for x in header_ints]
+        i += 1
+        rows_read = 0
+
+        while i < len(lines) and rows_read < dim:
+            row_line = lines[i].strip()
+
+            if not row_line:
+                i += 1
+                continue
+
+            if row_line.startswith("$"):
+                break
+
+            row_line = row_line.replace("D", "E").replace("d", "E")
+
+            nums = re.findall(
+                r"[-+]?\d*\.\d+(?:[Ee][-+]?\d+)?|[-+]?\d+(?:[Ee][-+]?\d+)?",
+                row_line
+            )
+
+            if len(nums) >= 2:
+                row_idx = int(float(nums[0]))
+                vals = [float(x) for x in nums[1:]]
+
+                for c, val in zip(col_indices, vals):
+                    if 0 <= row_idx < dim and 0 <= c < dim:
+                        H[row_idx, c] = val
+
+                rows_read += 1
+
+            i += 1
+
+    H = 0.5 * (H + H.T)
+
+    if not np.any(np.abs(H) > 0.0):
+        raise RuntimeError(f"Parsed Hessian is all zeros:\n{hess_path}")
+
+    return H
+
+
+# ============================================================
+# Load and mass-weight MECP Hessians
+# ============================================================
+
+section("READING AND MASS-WEIGHTING MECP HESSIANS")
+
+print(f"MECP Hessian main/other : {MECP_hess_main_other_path}")
+print(f"MECP Hessian other/main : {MECP_hess_other_main_path}")
+
+H_mecp_main_other_cart = read_orca_hessian(
+    MECP_hess_main_other_path,
+    expected_dim=num_cart
+)
+
+H_mecp_other_main_cart = read_orca_hessian(
+    MECP_hess_other_main_path,
+    expected_dim=num_cart
+)
+
+mass_weight_matrix = 1.0 / np.sqrt(np.outer(mass_vector, mass_vector))
+
+H_mecp_main_other_mw = H_mecp_main_other_cart * mass_weight_matrix
+H_mecp_other_main_mw = H_mecp_other_main_cart * mass_weight_matrix
+
+print("Both Hessians were parsed successfully.")
+print(f"Hessian dimension : {H_mecp_main_other_cart.shape}")
+
+# ============================================================
+# Effective Hessian
+# ============================================================
+
+section("EFFECTIVE-HESSIAN CONSTRUCTION")
+
+H_eff_mw_plus = (
+    g_HS_norm_Eh_per_Bohr * H_mecp_main_other_mw
+    + g_LS_norm_Eh_per_Bohr * H_mecp_other_main_mw
+) / (g_LS_norm_Eh_per_Bohr + g_HS_norm_Eh_per_Bohr)
+
+if abs(g_HS_norm_Eh_per_Bohr - g_LS_norm_Eh_per_Bohr) > 1.0e-14:
+    H_eff_mw_minus = (
+        g_HS_norm_Eh_per_Bohr * H_mecp_main_other_mw
+        - g_LS_norm_Eh_per_Bohr * H_mecp_other_main_mw
+    ) / (g_HS_norm_Eh_per_Bohr - g_LS_norm_Eh_per_Bohr)
+else:
+    H_eff_mw_minus = H_eff_mw_plus.copy()
+
+if intersection_type == "peaked":
+    H_eff_mw_selected = H_eff_mw_plus.copy()
+    effective_hessian_choice = "plus/peaked"
+else:
+    H_eff_mw_selected = H_eff_mw_minus.copy()
+    effective_hessian_choice = "minus/sloped"
+
+H_eff_mw_average = 0.5 * (
+    H_mecp_main_other_mw + H_mecp_other_main_mw
+)
+
+H_eff_mw_gradweighted = H_eff_mw_selected.copy()
+
+print(f"Intersection type          : {intersection_type}")
+print(f"Effective Hessian selected : {effective_hessian_choice}")
+
+# ============================================================
+# Translation/rotation projector
+# ============================================================
+
+section("TRANSLATION/ROTATION PROJECTOR")
+
+R_cm = np.sum(coords_mecp * masses[:, None], axis=0) / np.sum(masses)
+coords_centered = coords_mecp - R_cm
+
+Z_raw = np.zeros((num_cart, 6), dtype=float)
+
+# Translations
+for k in range(3):
+    for a in range(natoms):
+        Z_raw[3 * a + k, k] = np.sqrt(masses[a])
+
+# Rotations
+for a in range(natoms):
+    x, y, z = coords_centered[a]
+    m_sqrt = np.sqrt(masses[a])
+    idx = 3 * a
+
+    Z_raw[idx,     3] = 0.0
+    Z_raw[idx + 1, 3] = m_sqrt * z
+    Z_raw[idx + 2, 3] = -m_sqrt * y
+
+    Z_raw[idx,     4] = -m_sqrt * z
+    Z_raw[idx + 1, 4] = 0.0
+    Z_raw[idx + 2, 4] = m_sqrt * x
+
+    Z_raw[idx,     5] = m_sqrt * y
+    Z_raw[idx + 1, 5] = -m_sqrt * x
+    Z_raw[idx + 2, 5] = 0.0
+
+Z = orth(Z_raw)
+P_TR = Z @ Z.T
+P_RT = np.eye(num_cart) - P_TR
+
+print(f"Rigid-body subspace dimension : {Z.shape[1]}")
+print(f"||P_TR^2 - P_TR||             : {np.linalg.norm(P_TR @ P_TR - P_TR):.3e}")
+print(f"||P_RT^2 - P_RT||             : {np.linalg.norm(P_RT @ P_RT - P_RT):.3e}")
+
+# ============================================================
+# RC mass helpers
+# ============================================================
+
+def rc_mass_from_vector(k_mw):
+    k_mw = normalize_vector(k_mw, "mass-weighted RC vector")
+
+    k_cart_mass_unweighted = k_mw / sqrt_mass_vector
+    denom = float(np.dot(k_cart_mass_unweighted, k_cart_mass_unweighted))
+
+    if denom <= 0.0 or not np.isfinite(denom):
+        return np.nan, k_cart_mass_unweighted
+
+    return 1.0 / denom, k_cart_mass_unweighted
+
+
+def build_reaction_coordinate_candidates(seed_cart, label):
+    seed_cart = np.asarray(seed_cart, dtype=float).reshape(-1)
+
+    seed_mw_div = seed_cart / sqrt_mass_vector
+    seed_mw_mul = seed_cart * sqrt_mass_vector
+
+    candidates = []
+
+    for convention, seed_mw_raw in [
+        ("seed/sqrt(m)", seed_mw_div),
+        ("seed*sqrt(m)", seed_mw_mul)
+    ]:
+        seed_mw = P_RT @ seed_mw_raw
+        seed_mw = normalize_vector(seed_mw, label + " " + convention)
+
+        P_RC_seed = np.outer(seed_mw, seed_mw)
+        P_TOTAL = P_TR + P_RC_seed
+
+        H_proj = (
+            (np.eye(num_cart) - P_TOTAL)
+            @ H_eff_mw_selected
+            @ (np.eye(num_cart) - P_TOTAL)
+        )
+        H_proj = 0.5 * (H_proj + H_proj.T)
+
+        eigvals, eigvecs = np.linalg.eigh(H_proj)
+
+        idx_abs = np.argsort(np.abs(eigvals))
+        eigvals_abs_sorted = eigvals[idx_abs]
+        eigvecs_abs_sorted = eigvecs[:, idx_abs]
+
+        scores = []
+
+        for j in range(min(12, num_cart)):
+            v = normalize_vector(
+                eigvecs_abs_sorted[:, j],
+                "projected zero-mode candidate"
+            )
+
+            rt_ov = float(np.linalg.norm(Z.T @ v) ** 2)
+            rc_ov = float(abs(np.dot(seed_mw, v)) ** 2)
+            eig_abs = float(abs(eigvals_abs_sorted[j]))
+
+            scores.append((j, rc_ov, rt_ov, eig_abs))
+
+        scores_sorted = sorted(
+            scores,
+            key=lambda x: (x[1] - x[2], -x[3]),
+            reverse=True
+        )
+
+        best_local_idx = scores_sorted[0][0]
+
+        k_zero = normalize_vector(
+            eigvecs_abs_sorted[:, best_local_idx],
+            "selected projected RC zero eigenvector"
+        )
+
+        if np.dot(k_zero, seed_mw) < 0.0:
+            k_zero = -k_zero
+
+        mu_zero, k_zero_cart_like = rc_mass_from_vector(k_zero)
+
+        H_RC = P_RC_seed @ H_eff_mw_selected @ P_RC_seed
+        H_RC = 0.5 * (H_RC + H_RC.T)
+
+        eigvals_rc, eigvecs_rc = np.linalg.eigh(H_RC)
+        idx_rc = int(np.argmax(np.abs(eigvecs_rc.T @ seed_mw)))
+
+        k_rc_direct = normalize_vector(
+            eigvecs_rc[:, idx_rc],
+            "direct RC vector"
+        )
+
+        if np.dot(k_rc_direct, seed_mw) < 0.0:
+            k_rc_direct = -k_rc_direct
+
+        mu_direct, k_direct_cart_like = rc_mass_from_vector(k_rc_direct)
+
+        candidates.append({
+            "label": label,
+            "convention": convention,
+            "seed_mw": seed_mw,
+            "P_RC": P_RC_seed,
+            "P_TOTAL": P_TOTAL,
+            "H_proj": H_proj,
+            "eigvals_proj": eigvals,
+            "eigvecs_proj": eigvecs,
+            "zero_mode_scores": scores,
+            "best_zero_local_idx": int(best_local_idx),
+            "best_zero_eigval": float(eigvals_abs_sorted[best_local_idx]),
+            "k_zero": k_zero,
+            "k_zero_cart_like": k_zero_cart_like,
+            "mu_zero_amu": float(mu_zero),
+            "H_RC": H_RC,
+            "eigvals_rc": eigvals_rc,
+            "eigvecs_rc": eigvecs_rc,
+            "k_rc_direct": k_rc_direct,
+            "k_rc_direct_cart_like": k_direct_cart_like,
+            "mu_direct_amu": float(mu_direct),
+            "rt_overlap_zero": float(np.linalg.norm(Z.T @ k_zero) ** 2),
+            "rc_overlap_zero": float(abs(np.dot(seed_mw, k_zero)) ** 2)
+        })
+
+    return candidates
+
+
+# ============================================================
+# RC candidates and final selection
+# ============================================================
+
+section("REACTION-COORDINATE CANDIDATES")
+
+g_LS_unit = g_LS / g_LS_norm_Eh_per_Bohr
+g_HS_unit = g_HS / g_HS_norm_Eh_per_Bohr
+
+rc_candidates = []
+
+rc_candidates += build_reaction_coordinate_candidates(reverse_surface_gradient_difference_cart, "gradient difference = g_HS - g_LS")
+rc_candidates += build_reaction_coordinate_candidates(surface_gradient_sum_cart, "gradient sum = g_HS + g_LS")
+rc_candidates += build_reaction_coordinate_candidates(g_HS_unit - g_LS_unit, "unit gradient difference")
+rc_candidates += build_reaction_coordinate_candidates(g_HS_unit + g_LS_unit, "unit gradient sum")
+
+selected_rc = None
+
+for cand in rc_candidates:
+    if (
+        cand["label"].startswith("gradient difference")
+        and cand["convention"] == "seed/sqrt(m)"
+    ):
+        selected_rc = cand
+        break
+
+if selected_rc is None:
+    raise RuntimeError(
+        "Could not select the required gradient-difference RC candidate with the seed/sqrt(m) convention."
+    )
+
+reduced_mass_amu = float(selected_rc["mu_direct_amu"])
+
+reaction_direction_hessian_mw = selected_rc["seed_mw"]
+reaction_direction_hessian_cart = selected_rc["k_rc_direct_cart_like"]
+reaction_direction_hessian_cart = normalize_vector(
+    reaction_direction_hessian_cart,
+    "reaction_direction_hessian_cart"
+)
+
+P_RC = selected_rc["P_RC"]
+P_TOTAL = selected_rc["P_TOTAL"]
+H_proj_selected = selected_rc["H_proj"]
+H_RC_selected = selected_rc["H_RC"]
+
+reduced_mass_effhess_zero_selected_amu = float(selected_rc["mu_zero_amu"])
+reduced_mass_effhess_direct_selected_amu = float(selected_rc["mu_direct_amu"])
+
+print("Final automatic RC selection:")
+print("  Selection rule 1 : use the g_HS - g_LS gradient difference")
+print("  Selection rule 2 : use seed/sqrt(m) mass-weighted convention")
+print("  Selection rule 3 : use the direct RC mass downstream")
+print("")
+print(f"  Selected label              : {selected_rc['label']}")
+print(f"  Selected convention         : {selected_rc['convention']}")
+print(f"  zero-mode mass       : {reduced_mass_effhess_zero_selected_amu:.8f} amu")
+print(f"  direct mass          : {reduced_mass_effhess_direct_selected_amu:.8f} amu")
+print(f"  FINAL reduced_mass_amu       : {reduced_mass_amu:.8f} amu")
+
+# ============================================================
+# Projected transverse effective-Hessian frequencies
+# ============================================================
+
+section("PROJECTED EFFECTIVE-HESSIAN FREQUENCIES")
+
+P_REMOVE = P_TOTAL
+P_KEEP = np.eye(num_cart) - P_REMOVE
+
+H_eff_projected_transverse = (
+    P_KEEP @ H_eff_mw_selected @ P_KEEP
+)
+H_eff_projected_transverse = 0.5 * (
+    H_eff_projected_transverse + H_eff_projected_transverse.T
+)
+
+eigvals_eff, eigvecs_eff = np.linalg.eigh(H_eff_projected_transverse)
+
+idx_sort = np.argsort(eigvals_eff)
+eigvals_eff = eigvals_eff[idx_sort]
+eigvecs_eff = eigvecs_eff[:, idx_sort]
+
+rt_overlap_eff = np.asarray([
+    np.linalg.norm(Z.T @ eigvecs_eff[:, j]) ** 2
+    for j in range(num_cart)
+])
+
+rc_overlap_eff = np.asarray([
+    abs(np.dot(reaction_direction_hessian_mw, eigvecs_eff[:, j])) ** 2
+    for j in range(num_cart)
+])
+
+zero_like_mask = (
+    (rt_overlap_eff > 1.0e-6)
+    | (rc_overlap_eff > 1.0e-6)
+)
+
+conversion_factor = 5140.48
+freq_eff_cm1 = np.zeros(num_cart)
+
+for j in range(num_cart):
+    if zero_like_mask[j]:
+        freq_eff_cm1[j] = 0.0
+    else:
+        val = eigvals_eff[j]
+        freq_eff_cm1[j] = np.sign(val) * np.sqrt(abs(val)) * conversion_factor
+
+freq_MECP_effhess_real_cm1 = freq_eff_cm1[freq_eff_cm1 > 1.0e-8]
+freq_MECP_effhess_imag_cm1 = freq_eff_cm1[freq_eff_cm1 < -1.0e-8]
+freq_MECP_effhess_zero_cm1 = freq_eff_cm1[
+    np.isclose(freq_eff_cm1, 0.0, atol=1.0e-8)
+]
+
+freq_MECP_real_cm1 = freq_MECP_effhess_real_cm1
+freq_MECP_imag_cm1 = freq_MECP_effhess_imag_cm1
+freq_MECP_zero_cm1 = freq_MECP_effhess_zero_cm1
+
+crossing_effective_frequencies_cm1 = (
+    freq_MECP_effhess_real_cm1
+)
+crossing_effective_imaginary_frequencies_cm1 = (
+    freq_MECP_effhess_imag_cm1
+)
+crossing_effective_zero_frequencies_cm1 = (
+    freq_MECP_effhess_zero_cm1
+)
+
+print(f"Zero-like modes removed          : {len(freq_MECP_effhess_zero_cm1)}")
+print(f"Real transverse frequencies      : {len(freq_MECP_effhess_real_cm1)}")
+print(f"Imaginary transverse frequencies : {len(freq_MECP_effhess_imag_cm1)}")
+
+if len(freq_MECP_effhess_imag_cm1) > 0:
+    print("\nImaginary effective-Hessian frequencies:")
+    print(freq_MECP_effhess_imag_cm1)
+
+# ============================================================
+# Store Hessian arrays
+# ============================================================
+
+hessian_data_MECP = np.zeros((num_cart, num_cart, 2), dtype=float)
+hessian_data_MECP[:, :, 0] = H_mecp_main_other_cart
+hessian_data_MECP[:, :, 1] = H_mecp_other_main_cart
+
+mw_hessian_data_MECP = np.zeros((num_cart, num_cart, 2), dtype=float)
+mw_hessian_data_MECP[:, :, 0] = H_mecp_main_other_mw
+mw_hessian_data_MECP[:, :, 1] = H_mecp_other_main_mw
+
+# ============================================================
+# Diagnostics
+# ============================================================
+
+section("RC CANDIDATE DIAGNOSTICS")
+
+for i, cand in enumerate(rc_candidates, start=1):
+    print(f"{i:2d}. {cand['label']:25s} | {cand['convention']:12s}")
+    print(f"    zero-mode μ       = {cand['mu_zero_amu']:.8f} amu")
+    print(f"    direct μ          = {cand['mu_direct_amu']:.8f} amu")
+    print(f"    zero eigenvalue           = {cand['best_zero_eigval']:.12e}")
+    print(f"    RC overlap                = {cand['rc_overlap_zero']:.8f}")
+    print(f"    RT overlap                = {cand['rt_overlap_zero']:.8e}")
+
+section("SELECTED RC ATOMIC CONTRIBUTIONS")
+
+atom_contrib = atomic_contribution_from_vector(
+    reaction_direction_hessian_cart,
+    symbols_mecp
+)
+
+for atom_idx, sym, amp in atom_contrib[:15]:
+    print(f"Atom {atom_idx:3d} ({sym:2s})   amplitude = {amp:.8f}")
+
+# ============================================================
+# Save Step 6 outputs
+# ============================================================
+
+section("SAVING STEP 6 OUTPUTS")
+
+local_step6 = os.path.join(local_base, "Effective_Hessian_RC")
+os.makedirs(local_step6, exist_ok=True)
+
+# Compatibility alias: in Local PC mode, remote_step6 is the same local path.
+remote_step6 = local_step6
+
+summary_file_step6 = os.path.join(
+    local_step6,
+    "Step6_effective_hessian_RC_summary.txt"
+)
+
+freq_file_step6 = os.path.join(
+    local_step6,
+    "Step6_effective_hessian_frequencies.txt"
+)
+
+rc_vector_file_step6 = os.path.join(
+    local_step6,
+    "Step6_reaction_coordinate_vectors.txt"
+)
+
+summary_lines = []
+
+summary_lines.append("Step 6 effective-Hessian reaction-coordinate reduced mass")
+summary_lines.append(f"Run mode = {RUN_MODE}")
+summary_lines.append(f"Workflow mode = {workflow_mode}")
+summary_lines.append("")
+summary_lines.append(f"Low-spin multiplicity = {mult_LS} ({spin_name_LS})")
+summary_lines.append(f"High-spin multiplicity = {mult_HS} ({spin_name_HS})")
+summary_lines.append("")
+summary_lines.append("[GRADIENTS]")
+summary_lines.append(f"g_LS_norm_Eh_per_Bohr = {g_LS_norm_Eh_per_Bohr:.12e} Eh/Bohr")
+summary_lines.append(f"g_HS_norm_Eh_per_Bohr = {g_HS_norm_Eh_per_Bohr:.12e} Eh/Bohr")
+summary_lines.append(f"g_LS_dot_g_HS = {gradient_dot_product:.12e}")
+summary_lines.append(f"intersection_type = {intersection_type}")
+summary_lines.append(f"GRADIENT_GAP_NORM_EH_PER_BOHR = {GRADIENT_GAP_NORM_EH_PER_BOHR:.12e}")
+summary_lines.append(f"low_spin_projected_gradient_magnitude = {low_spin_projected_gradient_magnitude:.12e}")
+summary_lines.append(f"high_spin_projected_gradient_magnitude = {high_spin_projected_gradient_magnitude:.12e}")
+summary_lines.append(f"PROJECTED_GRADIENT_MEAN_EH_PER_BOHR = {PROJECTED_GRADIENT_MEAN_EH_PER_BOHR:.12e}")
+summary_lines.append("")
+summary_lines.append("[HESSIANS]")
+summary_lines.append(f"MECP_hess_main_other_path = {MECP_hess_main_other_path}")
+summary_lines.append(f"MECP_hess_other_main_path = {MECP_hess_other_main_path}")
+summary_lines.append(f"effective_hessian_choice = {effective_hessian_choice}")
+summary_lines.append("")
+summary_lines.append("[REDUCED_MASSES]")
+summary_lines.append(f"reduced_mass_gradient_direction_amu = {reduced_mass_gradient_direction_amu:.12f}")
+summary_lines.append(f"reduced_mass_effhess_zero_selected_amu = {reduced_mass_effhess_zero_selected_amu:.12f}")
+summary_lines.append(f"reduced_mass_effhess_direct_selected_amu = {reduced_mass_effhess_direct_selected_amu:.12f}")
+summary_lines.append(f"FINAL reduced_mass_amu = {reduced_mass_amu:.12f}")
+summary_lines.append("")
+summary_lines.append("[SELECTED_RC]")
+summary_lines.append(f"selected_label = {selected_rc['label']}")
+summary_lines.append(f"selected_convention = {selected_rc['convention']}")
+summary_lines.append(f"selected_zero_eigenvalue = {selected_rc['best_zero_eigval']:.12e}")
+summary_lines.append(f"selected_rc_overlap = {selected_rc['rc_overlap_zero']:.12e}")
+summary_lines.append(f"selected_rt_overlap = {selected_rc['rt_overlap_zero']:.12e}")
+summary_lines.append("")
+summary_lines.append("[FREQUENCIES]")
+summary_lines.append(f"freq_MECP_effhess_real_count = {len(freq_MECP_effhess_real_cm1)}")
+summary_lines.append(f"freq_MECP_effhess_imag_count = {len(freq_MECP_effhess_imag_cm1)}")
+summary_lines.append(f"freq_MECP_effhess_zero_count = {len(freq_MECP_effhess_zero_cm1)}")
+summary_lines.append("")
+summary_lines.append("[RC_CANDIDATES]")
+
+for i, cand in enumerate(rc_candidates, start=1):
+    summary_lines.append(
+        f"{i:02d} | {cand['label']} | {cand['convention']} | "
+        f"mu_zero = {cand['mu_zero_amu']:.12f} | "
+        f"mu_direct = {cand['mu_direct_amu']:.12f} | "
+        f"eig_zero = {cand['best_zero_eigval']:.12e} | "
+        f"rc_overlap = {cand['rc_overlap_zero']:.12e} | "
+        f"rt_overlap = {cand['rt_overlap_zero']:.12e}"
+    )
+
+summary_lines.append("")
+summary_lines.append("[SELECTED_RC_ATOMIC_CONTRIBUTIONS]")
+
+for atom_idx, sym, amp in atom_contrib:
+    summary_lines.append(f"{atom_idx:5d} {sym:3s} {amp:.12e}")
+
+write_local_text(summary_file_step6, "\n".join(summary_lines) + "\n")
+
+freq_lines = []
+freq_lines.append("Step 6 effective-Hessian projected MECP frequencies")
+freq_lines.append("")
+freq_lines.append("[REAL_CM-1]")
+for value in freq_MECP_effhess_real_cm1:
+    freq_lines.append(f"{value:.12f}")
+
+freq_lines.append("")
+freq_lines.append("[IMAG_CM-1]")
+for value in freq_MECP_effhess_imag_cm1:
+    freq_lines.append(f"{value:.12f}")
+
+freq_lines.append("")
+freq_lines.append("[ZERO_CM-1]")
+for value in freq_MECP_effhess_zero_cm1:
+    freq_lines.append(f"{value:.12f}")
+
+write_local_text(freq_file_step6, "\n".join(freq_lines) + "\n")
+
+vector_lines = []
+vector_lines.append("Step 6 reaction-coordinate vectors")
+vector_lines.append("")
+vector_lines.append("# reaction_direction_hessian_cart")
+for value in reaction_direction_hessian_cart:
+    vector_lines.append(f"{value: .12e}")
+
+vector_lines.append("")
+vector_lines.append("# reaction_direction_hessian_mw")
+for value in reaction_direction_hessian_mw:
+    vector_lines.append(f"{value: .12e}")
+
+vector_lines.append("")
+vector_lines.append("# reverse_gradient_unit_vector = g_HS - g_LS normalized")
+for value in reverse_gradient_unit_vector:
+    vector_lines.append(f"{value: .12e}")
+
+vector_lines.append("")
+vector_lines.append("# gradient_difference_unit_vector = g_LS - g_HS normalized")
+for value in gradient_difference_unit_vector:
+    vector_lines.append(f"{value: .12e}")
+
+write_local_text(rc_vector_file_step6, "\n".join(vector_lines) + "\n")
+
+# Compatibility aliases: no remote upload is performed in Local PC mode.
+remote_summary_file_step6 = summary_file_step6
+remote_freq_file_step6 = freq_file_step6
+remote_rc_vector_file_step6 = rc_vector_file_step6
+
+print(f"Local Step 6 summary       : {summary_file_step6}")
+print(f"Local Step 6 frequencies   : {freq_file_step6}")
+print(f"Local Step 6 RC vectors    : {rc_vector_file_step6}")
+
+print(f"Step 6 summary alias       : {remote_summary_file_step6}")
+print(f"Step 6 frequencies alias   : {remote_freq_file_step6}")
+print(f"Step 6 RC vectors alias    : {remote_rc_vector_file_step6}")
+
+# ============================================================
+# Export variables for later steps
+# ============================================================
+
+globals().update({
+    "RUN_MODE": RUN_MODE,
+    "workflow_mode": workflow_mode,
+    "symbols_mecp": symbols_mecp,
+    "coords_mecp": coords_mecp,
+    "masses": masses,
+    "mass_vector": mass_vector,
+    "sqrt_mass_vector": sqrt_mass_vector,
+    "natoms": natoms,
+    "num_cart": num_cart,
+    "g_LS": g_LS,
+    "g_HS": g_HS,
+    "g_LS_norm_Eh_per_Bohr": g_LS_norm_Eh_per_Bohr,
+    "g_HS_norm_Eh_per_Bohr": g_HS_norm_Eh_per_Bohr,
+    "gradient_dot_product": gradient_dot_product,
+    "reverse_surface_gradient_difference_cart": reverse_surface_gradient_difference_cart,
+    "surface_gradient_difference_cart": surface_gradient_difference_cart,
+    "surface_gradient_difference_cart": surface_gradient_difference_cart,
+    "reverse_surface_gradient_difference_cart": reverse_surface_gradient_difference_cart,
+    "reverse_gradient_unit_vector": reverse_gradient_unit_vector,
+    "gradient_difference_unit_vector": gradient_difference_unit_vector,
+    "reaction_direction_cart": reaction_direction_cart,
+    "MECP_seam_normal_cart": MECP_seam_normal_cart,
+    "GRADIENT_GAP_NORM_EH_PER_BOHR": GRADIENT_GAP_NORM_EH_PER_BOHR,
+    "gradient_gap_magnitude": gradient_gap_magnitude,
+    "low_spin_projected_gradient_signed": low_spin_projected_gradient_signed,
+    "high_spin_projected_gradient_signed": high_spin_projected_gradient_signed,
+    "low_spin_projected_gradient_magnitude": low_spin_projected_gradient_magnitude,
+    "high_spin_projected_gradient_magnitude": high_spin_projected_gradient_magnitude,
+    "PROJECTED_GRADIENT_MEAN_EH_PER_BOHR": PROJECTED_GRADIENT_MEAN_EH_PER_BOHR,
+    "projected_gradient_mean_Eh_per_Bohr": projected_gradient_mean_Eh_per_Bohr,
+    "reduced_mass_gradient_direction_amu": reduced_mass_gradient_direction_amu,
+    "intersection_type": intersection_type,
+    "H_mecp_main_other_cart": H_mecp_main_other_cart,
+    "H_mecp_other_main_cart": H_mecp_other_main_cart,
+    "H_mecp_main_other_mw": H_mecp_main_other_mw,
+    "H_mecp_other_main_mw": H_mecp_other_main_mw,
+    "H_eff_mw_plus": H_eff_mw_plus,
+    "H_eff_mw_minus": H_eff_mw_minus,
+    "H_eff_mw_selected": H_eff_mw_selected,
+    "H_eff_mw_average": H_eff_mw_average,
+    "H_eff_mw_gradweighted": H_eff_mw_gradweighted,
+    "effective_hessian_choice": effective_hessian_choice,
+    "Z": Z,
+    "P_TR": P_TR,
+    "P_RT": P_RT,
+    "P_RC": P_RC,
+    "P_TOTAL": P_TOTAL,
+    "H_proj_selected": H_proj_selected,
+    "H_RC_selected": H_RC_selected,
+    "rc_candidates": rc_candidates,
+    "selected_rc": selected_rc,
+    "reaction_direction_hessian_cart": reaction_direction_hessian_cart,
+    "reaction_direction_hessian_mw": reaction_direction_hessian_mw,
+    "reduced_mass_amu": reduced_mass_amu,
+    "reduced_mass_effhess_zero_selected_amu": reduced_mass_effhess_zero_selected_amu,
+    "reduced_mass_effhess_direct_selected_amu": reduced_mass_effhess_direct_selected_amu,
+    "H_eff_projected_transverse": H_eff_projected_transverse,
+    "eigvals_eff": eigvals_eff,
+    "eigvecs_eff": eigvecs_eff,
+    "rt_overlap_eff": rt_overlap_eff,
+    "rc_overlap_eff": rc_overlap_eff,
+    "freq_eff_cm1": freq_eff_cm1,
+    "freq_MECP_effhess_real_cm1": freq_MECP_effhess_real_cm1,
+    "freq_MECP_effhess_imag_cm1": freq_MECP_effhess_imag_cm1,
+    "freq_MECP_effhess_zero_cm1": freq_MECP_effhess_zero_cm1,
+    "freq_MECP_real_cm1": freq_MECP_real_cm1,
+    "freq_MECP_imag_cm1": freq_MECP_imag_cm1,
+    "freq_MECP_zero_cm1": freq_MECP_zero_cm1,
+    "crossing_effective_frequencies_cm1":
+        crossing_effective_frequencies_cm1,
+    "crossing_effective_imaginary_frequencies_cm1":
+        crossing_effective_imaginary_frequencies_cm1,
+    "crossing_effective_zero_frequencies_cm1":
+        crossing_effective_zero_frequencies_cm1,
+    "hessian_data_MECP": hessian_data_MECP,
+    "mw_hessian_data_MECP": mw_hessian_data_MECP,
+    "local_step6": local_step6,
+    "remote_step6": remote_step6,
+    "summary_file_step6": summary_file_step6,
+    "freq_file_step6": freq_file_step6,
+    "rc_vector_file_step6": rc_vector_file_step6,
+    "remote_summary_file_step6": remote_summary_file_step6,
+    "remote_freq_file_step6": remote_freq_file_step6,
+    "remote_rc_vector_file_step6": remote_rc_vector_file_step6
+})
+
+# ============================================================
+# Final summary
+# ============================================================
+
+section("STEP 6 SUMMARY")
+
+print(f"Intersection type                    : {intersection_type}")
+print(f"Effective Hessian choice             : {effective_hessian_choice}")
+print(f"GRADIENT_GAP_NORM_EH_PER_BOHR          : {GRADIENT_GAP_NORM_EH_PER_BOHR:.12e}")
+print(f"PROJECTED_GRADIENT_MEAN_EH_PER_BOHR                 : {PROJECTED_GRADIENT_MEAN_EH_PER_BOHR:.12e}")
+print(f"Cartesian Δg reduced mass             : {reduced_mass_gradient_direction_amu:.8f} amu")
+print(f"Selected zero-mode mass       : {reduced_mass_effhess_zero_selected_amu:.8f} amu")
+print(f"Selected direct mass          : {reduced_mass_effhess_direct_selected_amu:.8f} amu")
+print(f"FINAL reduced_mass_amu                : {reduced_mass_amu:.8f} amu")
+print(f"Effective-Hessian real frequencies    : {len(freq_MECP_effhess_real_cm1)}")
+print(f"Effective-Hessian imaginary freqs     : {len(freq_MECP_effhess_imag_cm1)}")
+print(f"Effective-Hessian zero-like modes      : {len(freq_MECP_effhess_zero_cm1)}")
+
+print("\nImportant variables available for later steps:")
+print("  GRADIENT_GAP_NORM_EH_PER_BOHR")
+print("  PROJECTED_GRADIENT_MEAN_EH_PER_BOHR")
+print("  reduced_mass_amu")
+print("  reduced_mass_gradient_direction_amu")
+print("  reduced_mass_effhess_zero_selected_amu")
+print("  reduced_mass_effhess_direct_selected_amu")
+print("  reaction_direction_hessian_cart")
+print("  reaction_direction_hessian_mw")
+print("  H_eff_mw_selected")
+print("  H_eff_mw_average")
+print("  H_eff_mw_plus")
+print("  H_eff_mw_minus")
+print("  hessian_data_MECP")
+print("  mw_hessian_data_MECP")
+print("  P_TR, P_RT, P_RC, P_TOTAL, Z")
+print("  H_proj_selected")
+print("  H_RC_selected")
+print("  crossing_effective_frequencies_cm1")
+print("  freq_MECP_effhess_real_cm1")
+print("  freq_MECP_effhess_imag_cm1")
+print("  freq_MECP_effhess_zero_cm1")
+print("  freq_MECP_real_cm1")
+print("  freq_MECP_imag_cm1")
+print("  freq_MECP_zero_cm1")
+print("  rc_candidates")
+print("  selected_rc")
+
+print("\nSTEP 6 COMPLETED SUCCESSFULLY.\n")
+
+
+#%% STEP 7. Local PC TOTAL-ENERGY AND REACTION-COORDINATE VELOCITY GRID
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+print(r'''
+====================================================================
+ STEP 7 | LOCAL PC VERSION
+ Total-energy and reaction-coordinate velocity grid
+====================================================================
+
+This step uses the effective-Hessian crossing-point frequencies and
+reaction-coordinate reduced mass from Step 6 to construct the common
+1 cm^-1 energy grid used by the probability and rate calculations.
+
+No new ORCA calculation is performed here.
+No SSH, no SFTP, no PBS/qsub, and no remote cluster directory are used.
+
+The active downstream MECP barrier is defined as
+
+  VaG_MECP_cm1 =
+      VaG_MECP_electronic_cm1
+    + ZPE_effhess(MECP)
+    - ZPE(reference)
+
+where ZPE_effhess(MECP) is computed from the projected transverse
+effective-Hessian frequencies generated in Step 6.
+
+The common total-energy grid is
+
+  total_energy_grid_cm1 =
+      0, 1, 2, ..., maximum_energy_bin_index cm^-1
+
+and the reaction-coordinate excess energy is
+
+  reaction_coordinate_excess_energy_cm1 =
+      total_energy_grid_cm1 - VaG_MECP_cm1.
+
+The velocity is evaluated as
+
+  v = sqrt(2 epsilon_rc / mu)     for epsilon_rc > 0
+  v = 0                           for epsilon_rc <= 0
+
+The same total-energy and velocity arrays are exported for Step 8 so
+that effective, intermediate, and spin-projection-resolved probabilities
+are evaluated on the identical grid used for the rate calculations.
+''')
+
+# ============================================================
+# Required variables from Steps 1–6
+# ============================================================
+
+required_vars_step7 = [
+    "jobname",
+    "VaG_MECP_electronic_cm1",
+    "reduced_mass_amu",
+    "GRADIENT_GAP_NORM_EH_PER_BOHR",
+    "PROJECTED_GRADIENT_MEAN_EH_PER_BOHR",
+    "freq_MECP_effhess_real_cm1",
+    "local_base",
+    "remote_base"
+]
+
+for var in required_vars_step7:
+    if var not in globals():
+        raise RuntimeError(
+            f"Required variable '{var}' is missing. Run Local PC Steps 1–6 first."
+        )
+
+RUN_MODE = globals().get("RUN_MODE", "LOCAL")
+workflow_mode = "MECP_ONLY"
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def section(title):
+    print("\n" + "=" * 72)
+    print(f" {title}")
+    print("=" * 72 + "\n")
+
+
+def ask_float(prompt, default=None, minimum=None):
+    while True:
+        ans = input(prompt).strip()
+
+        if ans == "" and default is not None:
+            val = float(default)
+        else:
+            try:
+                val = float(ans)
+            except ValueError:
+                print("  Please enter a valid numerical value.")
+                continue
+
+        if minimum is not None and val < minimum:
+            print(f"  Please enter a value greater than or equal to {minimum}.")
+            continue
+
+        return val
+
+
+def write_local_text(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+# ============================================================
+# Reference and MECP ZPE preparation
+# ============================================================
+
+section("REFERENCE AND MECP ZPE PREPARATION")
+
+hartree_to_cm = float(globals().get("hartree_to_cm", 219474.6313705))
+
+if "ZPE_REF_from_freq_cm1" not in globals():
+    if "ZPE_REF_thermo_hartree" in globals():
+        ZPE_REF_from_freq_cm1 = (
+            float(ZPE_REF_thermo_hartree) * hartree_to_cm
+        )
+    elif "ZPE_REF_hartree" in globals():
+        ZPE_REF_from_freq_cm1 = (
+            float(ZPE_REF_hartree) * hartree_to_cm
+        )
+    else:
+        raise RuntimeError(
+            "Reference ZPE is missing. Need ZPE_REF_from_freq_cm1, "
+            "ZPE_REF_thermo_hartree, or ZPE_REF_hartree from Step 5."
+        )
+
+freq_MECP_effhess_real_cm1 = np.asarray(
+    freq_MECP_effhess_real_cm1,
+    dtype=float
+).reshape(-1)
+
+freq_MECP_effhess_real_cm1 = freq_MECP_effhess_real_cm1[
+    np.isfinite(freq_MECP_effhess_real_cm1)
+    & (freq_MECP_effhess_real_cm1 > 0.0)
+]
+
+if freq_MECP_effhess_real_cm1.size == 0:
+    raise RuntimeError(
+        "freq_MECP_effhess_real_cm1 is empty. "
+        "Step 6 did not produce usable MECP effective-Hessian frequencies."
+    )
+
+ZPE_MECP_effhess_cm1 = (
+    0.5 * float(np.sum(freq_MECP_effhess_real_cm1))
+)
+
+Delta_ZPE_MECP_minus_REF_cm1 = (
+    ZPE_MECP_effhess_cm1
+    - float(ZPE_REF_from_freq_cm1)
+)
+
+VaG_MECP_ZPE_corrected_cm1 = (
+    float(VaG_MECP_electronic_cm1)
+    + Delta_ZPE_MECP_minus_REF_cm1
+)
+
+VaG_MECP_cm1 = float(VaG_MECP_ZPE_corrected_cm1)
+VaG_MECP_kJmol = VaG_MECP_cm1 * 0.01196266
+
+VaG_MECP_barrier_label = (
+    "ZPE-corrected MECP barrier = electronic barrier "
+    "+ ZPE_effhess(MECP) - ZPE(reference)"
+)
+
+E_MECP = VaG_MECP_cm1
+E_MECP_cm1 = VaG_MECP_cm1
+
+print("Barrier summary relative to reference minimum:")
+print(f"  Electronic MECP barrier          = {VaG_MECP_electronic_cm1:.6f} cm^-1")
+print(f"  Reference ZPE                    = {ZPE_REF_from_freq_cm1:.6f} cm^-1")
+print(f"  MECP effective-Hessian ZPE       = {ZPE_MECP_effhess_cm1:.6f} cm^-1")
+print(f"  Delta ZPE, MECP - REF            = {Delta_ZPE_MECP_minus_REF_cm1:.6f} cm^-1")
+print(f"  Active ZPE-corrected barrier     = {VaG_MECP_cm1:.6f} cm^-1")
+print(f"  Active ZPE-corrected barrier     = {VaG_MECP_kJmol:.6f} kJ/mol")
+
+# ============================================================
+# Common total-energy grid
+# ============================================================
+
+section("COMMON TOTAL-ENERGY GRID")
+
+print(
+    "The entered value is the maximum reaction-coordinate energy "
+    "above the ZPE-corrected MECP barrier."
+)
+print(
+    "Step 7 converts this value into the common 1 cm^-1 total-energy "
+    "grid used by Steps 8 and 9.\n"
+)
+
+maximum_reaction_coordinate_energy_cm1 = ask_float(
+    "Maximum reaction-coordinate energy above MECP, cm^-1, e.g. 5000: ",
+    minimum=1.0e-12
+)
+
+energy_step_cm1 = 1.0
+
+requested_maximum_total_energy_cm1 = (
+    float(VaG_MECP_cm1)
+    + float(maximum_reaction_coordinate_energy_cm1)
+)
+
+maximum_energy_bin_index = int(
+    np.ceil(
+        requested_maximum_total_energy_cm1
+        / energy_step_cm1
+    )
+)
+
+total_energy_grid_cm1 = (
+    np.arange(
+        maximum_energy_bin_index + 1,
+        dtype=float
+    )
+    * energy_step_cm1
+)
+
+if total_energy_grid_cm1.size == 0:
+    raise RuntimeError("The common total-energy grid is empty.")
+
+crossing_energy_bin_index = int(
+    np.ceil(
+        E_MECP / energy_step_cm1
+    )
+)
+
+probability_energy_grid_cm1 = total_energy_grid_cm1.copy()
+
+reaction_coordinate_excess_energy_cm1 = (
+    total_energy_grid_cm1 - E_MECP
+)
+
+positive_reaction_coordinate_energy_cm1 = np.maximum(
+    reaction_coordinate_excess_energy_cm1,
+    0.0
+)
+
+energy_above_crossing_cm1 = (
+    reaction_coordinate_excess_energy_cm1.copy()
+)
+
+energy_relative_to_crossing_cm1 = (
+    reaction_coordinate_excess_energy_cm1.copy()
+)
+
+number_of_energy_points = int(
+    total_energy_grid_cm1.size
+)
+
+minimum_total_energy_cm1 = float(
+    total_energy_grid_cm1[0]
+)
+
+E_max_cm1 = float(
+    total_energy_grid_cm1[-1]
+)
+
+maximum_total_energy_cm1 = E_max_cm1
+interoperability_maximum_energy_cm1 = E_max_cm1
+
+print(f"Energy spacing                      = {energy_step_cm1:.6f} cm^-1")
+print(f"Number of total-energy bins         = {number_of_energy_points}")
+print(f"MECP energy                         = {E_MECP:.6f} cm^-1")
+print(f"MECP bin index                      = {crossing_energy_bin_index}")
+print(
+    f"Requested maximum energy            = "
+    f"{requested_maximum_total_energy_cm1:.6f} cm^-1"
+)
+print(
+    f"Actual maximum grid energy          = "
+    f"{maximum_total_energy_cm1:.6f} cm^-1"
+)
+print(
+    f"Total-energy grid                   = "
+    f"{minimum_total_energy_cm1:.6f} to "
+    f"{maximum_total_energy_cm1:.6f} cm^-1"
+)
+print(
+    f"Requested energy above MECP         = "
+    f"0.000000 to "
+    f"{maximum_reaction_coordinate_energy_cm1:.6f} cm^-1"
+)
+
+# ============================================================
+# Velocity grid, identical to Step 9
+# ============================================================
+
+section("MICROCANONICAL VELOCITY GRID")
+
+h_SI = 6.62607015e-34
+c_SI = 2.99792458e8
+amu_to_kg = 1.66053906660e-27
+bohr_m = 5.29177210903e-11
+bohr_to_m = bohr_m
+
+mu_kg = float(reduced_mass_amu) * amu_to_kg
+
+if not np.isfinite(mu_kg) or mu_kg <= 0.0:
+    raise RuntimeError("Invalid reduced mass. Check Step 6.")
+
+E_excess_J = (
+    reaction_coordinate_excess_energy_cm1
+    * 100.0
+    * h_SI
+    * c_SI
+)
+
+v_m_s = np.zeros_like(total_energy_grid_cm1, dtype=float)
+
+mask_energy = E_excess_J > 0.0
+
+v_m_s[mask_energy] = np.sqrt(
+    2.0 * E_excess_J[mask_energy] / mu_kg
+)
+
+v_bohr_s = v_m_s / bohr_m
+
+velocity_floor = 1.0e-12
+
+v_bohr_s_safe = np.copy(v_bohr_s)
+v_bohr_s_safe[v_bohr_s_safe <= velocity_floor] = 1.0e-300
+
+epsilon_rc_J = E_excess_J.copy()
+
+print("MECP velocity calculation completed.")
+print(f"  reduced_mass_amu                  = {reduced_mass_amu:.8f} amu")
+print(f"  mu_kg                             = {mu_kg:.12e} kg")
+print(f"  GRADIENT_GAP_NORM_EH_PER_BOHR      = {GRADIENT_GAP_NORM_EH_PER_BOHR:.12e}")
+print(f"  PROJECTED_GRADIENT_MEAN_EH_PER_BOHR             = {PROJECTED_GRADIENT_MEAN_EH_PER_BOHR:.12e}")
+print(f"  Velocity range                    = {np.nanmin(v_m_s):.6e} to {np.nanmax(v_m_s):.6e} m/s")
+print(f"  Velocity range                    = {np.nanmin(v_bohr_s):.6e} to {np.nanmax(v_bohr_s):.6e} Bohr/s")
+
+# ============================================================
+# Plot velocity
+# ============================================================
+
+section("PLOTTING VELOCITY GRID")
+
+local_step7 = os.path.join(
+    local_base,
+    "RC_energy_velocity_grid"
+)
+
+os.makedirs(local_step7, exist_ok=True)
+
+velocity_plot_file = os.path.join(
+    local_step7,
+    "Step7_velocity_grid.png"
+)
+
+plt.figure(figsize=(7.5, 4.5))
+plt.plot(total_energy_grid_cm1, v_m_s, linewidth=2)
+plt.axvline(
+    E_MECP,
+    linestyle="--",
+    linewidth=1.5,
+    label="ZPE-corrected MECP"
+)
+plt.xlabel("Total energy relative to reference minimum (cm$^{-1}$)")
+plt.ylabel("Velocity at MECP (m/s)")
+plt.title(" Microcanonical Reaction-Coordinate Velocity at the MECP")
+plt.grid(False)
+plt.legend()
+plt.tight_layout()
+plt.savefig(velocity_plot_file, dpi=300)
+plt.show()
+
+print(f"Velocity plot saved locally: {velocity_plot_file}")
+
+# ============================================================
+# Save Step 7 outputs
+# ============================================================
+
+section("SAVING STEP 7 OUTPUTS")
+
+# Local PC compatibility alias. No remote directory is created.
+# The remote_* name is retained only because later shared workflow steps
+# may still expect it to exist.
+remote_step7 = local_step7
+
+summary_file_step7 = os.path.join(
+    local_step7,
+    "Step7_energy_velocity_summary.txt"
+)
+
+grid_file_step7 = os.path.join(
+    local_step7,
+    "Step7_energy_velocity_grid.txt"
+)
+
+summary_lines = [
+    "Step 7 common total-energy and velocity grid",
+    f"Run mode = {RUN_MODE}",
+    f"Workflow mode = {workflow_mode}",
+    "",
+    "[BARRIER]",
+    f"VaG_MECP_electronic_cm1 = {VaG_MECP_electronic_cm1:.12f}",
+    f"ZPE_REF_from_freq_cm1 = {ZPE_REF_from_freq_cm1:.12f}",
+    f"ZPE_MECP_effhess_cm1 = {ZPE_MECP_effhess_cm1:.12f}",
+    f"Delta_ZPE_MECP_minus_REF_cm1 = {Delta_ZPE_MECP_minus_REF_cm1:.12f}",
+    f"VaG_MECP_ZPE_corrected_cm1 = {VaG_MECP_ZPE_corrected_cm1:.12f}",
+    f"VaG_MECP_cm1 = {VaG_MECP_cm1:.12f}",
+    f"VaG_MECP_kJmol = {VaG_MECP_kJmol:.12f}",
+    f"VaG_MECP_barrier_label = {VaG_MECP_barrier_label}",
+    "",
+    "[GRID]",
+    f"energy_step_cm1 = {energy_step_cm1:.12f}",
+    f"maximum_energy_bin_index = {maximum_energy_bin_index}",
+    f"crossing_energy_bin_index = {crossing_energy_bin_index}",
+    f"number_of_energy_points = {number_of_energy_points}",
+    f"maximum_reaction_coordinate_energy_cm1 = {maximum_reaction_coordinate_energy_cm1:.12f}",
+    f"requested_maximum_total_energy_cm1 = {requested_maximum_total_energy_cm1:.12f}",
+    f"minimum_total_energy_cm1 = {minimum_total_energy_cm1:.12f}",
+    f"E_max_cm1 = {E_max_cm1:.12f}",
+    f"interoperability_maximum_energy_cm1 = {interoperability_maximum_energy_cm1:.12f}",
+    "",
+    "[VELOCITY]",
+    f"reduced_mass_amu = {reduced_mass_amu:.12f}",
+    f"mu_kg = {mu_kg:.12e}",
+    f"GRADIENT_GAP_NORM_EH_PER_BOHR = {GRADIENT_GAP_NORM_EH_PER_BOHR:.12e}",
+    f"PROJECTED_GRADIENT_MEAN_EH_PER_BOHR = {PROJECTED_GRADIENT_MEAN_EH_PER_BOHR:.12e}",
+    f"velocity_floor = {velocity_floor:.12e}",
+    f"v_m_s_min = {np.nanmin(v_m_s):.12e}",
+    f"v_m_s_max = {np.nanmax(v_m_s):.12e}",
+    f"v_bohr_s_min = {np.nanmin(v_bohr_s):.12e}",
+    f"v_bohr_s_max = {np.nanmax(v_bohr_s):.12e}",
+    "",
+    "[FILES]",
+    f"velocity_plot_file = {velocity_plot_file}",
+    f"grid_file_step7 = {grid_file_step7}",
+]
+
+write_local_text(
+    summary_file_step7,
+    "\n".join(summary_lines) + "\n"
+)
+
+grid_lines = [
+    "total_energy_cm1  reaction_coordinate_excess_energy_cm1  "
+    "positive_reaction_coordinate_energy_cm1  excess_energy_J  "
+    "velocity_m_s  velocity_bohr_s  velocity_bohr_s_safe"
+]
+
+for E, eps, eps_pos, eps_J, vm, vb, vbs in zip(
+    total_energy_grid_cm1,
+    reaction_coordinate_excess_energy_cm1,
+    positive_reaction_coordinate_energy_cm1,
+    E_excess_J,
+    v_m_s,
+    v_bohr_s,
+    v_bohr_s_safe
+):
+    grid_lines.append(
+        f"{E:18.10f} "
+        f"{eps:18.10f} "
+        f"{eps_pos:18.10f} "
+        f"{eps_J:18.10e} "
+        f"{vm:18.10e} "
+        f"{vb:18.10e} "
+        f"{vbs:18.10e}"
+    )
+
+write_local_text(
+    grid_file_step7,
+    "\n".join(grid_lines) + "\n"
+)
+
+# Local PC compatibility aliases. These are the same local files.
+remote_summary_file_step7 = summary_file_step7
+remote_grid_file_step7 = grid_file_step7
+remote_velocity_plot_file = velocity_plot_file
+
+print(f"Local Step 7 summary       : {summary_file_step7}")
+print(f"Local Step 7 grid          : {grid_file_step7}")
+print(f"Local Step 7 velocity plot : {velocity_plot_file}")
+print(f"Step 7 summary alias       : {remote_summary_file_step7}")
+print(f"Step 7 grid alias          : {remote_grid_file_step7}")
+print(f"Step 7 plot alias          : {remote_velocity_plot_file}")
+
+# ============================================================
+# Export variables for later steps
+# ============================================================
+
+globals().update({
+    "RUN_MODE": RUN_MODE,
+    "workflow_mode": workflow_mode,
+    "hartree_to_cm": hartree_to_cm,
+    "ZPE_REF_from_freq_cm1": ZPE_REF_from_freq_cm1,
+    "ZPE_MECP_effhess_cm1": ZPE_MECP_effhess_cm1,
+    "Delta_ZPE_MECP_minus_REF_cm1": Delta_ZPE_MECP_minus_REF_cm1,
+    "VaG_MECP_ZPE_corrected_cm1": VaG_MECP_ZPE_corrected_cm1,
+    "VaG_MECP_cm1": VaG_MECP_cm1,
+    "VaG_MECP_kJmol": VaG_MECP_kJmol,
+    "VaG_MECP_barrier_label": VaG_MECP_barrier_label,
+    "E_MECP": E_MECP,
+    "E_MECP_cm1": E_MECP_cm1,
+    "energy_step_cm1": energy_step_cm1,
+    "maximum_energy_bin_index": maximum_energy_bin_index,
+    "crossing_energy_bin_index": crossing_energy_bin_index,
+    "total_energy_grid_cm1": total_energy_grid_cm1,
+    "probability_energy_grid_cm1": probability_energy_grid_cm1,
+    "reaction_coordinate_excess_energy_cm1": reaction_coordinate_excess_energy_cm1,
+    "positive_reaction_coordinate_energy_cm1": positive_reaction_coordinate_energy_cm1,
+    "maximum_reaction_coordinate_energy_cm1": maximum_reaction_coordinate_energy_cm1,
+    "energy_above_crossing_cm1": energy_above_crossing_cm1,
+    "energy_relative_to_crossing_cm1": energy_relative_to_crossing_cm1,
+    "number_of_energy_points": number_of_energy_points,
+    "minimum_total_energy_cm1": minimum_total_energy_cm1,
+    "requested_maximum_total_energy_cm1": requested_maximum_total_energy_cm1,
+    "E_max_cm1": E_max_cm1,
+    "maximum_total_energy_cm1": maximum_total_energy_cm1,
+    "interoperability_maximum_energy_cm1":
+        interoperability_maximum_energy_cm1,
+    "h_SI": h_SI,
+    "c_SI": c_SI,
+    "amu_to_kg": amu_to_kg,
+    "bohr_m": bohr_m,
+    "bohr_to_m": bohr_to_m,
+    "mu_kg": mu_kg,
+    "E_excess_J": E_excess_J,
+    "epsilon_rc_J": epsilon_rc_J,
+    "v_m_s": v_m_s,
+    "v_bohr_s": v_bohr_s,
+    "v_bohr_s_safe": v_bohr_s_safe,
+    "velocity_floor": velocity_floor,
+    "local_step7": local_step7,
+    "remote_step7": remote_step7,
+    "summary_file_step7": summary_file_step7,
+    "grid_file_step7": grid_file_step7,
+    "velocity_plot_file": velocity_plot_file,
+    "remote_summary_file_step7": remote_summary_file_step7,
+    "remote_grid_file_step7": remote_grid_file_step7,
+    "remote_velocity_plot_file": remote_velocity_plot_file
+})
+
+# ============================================================
+# Final summary
+# ============================================================
+
+section("STEP 7 SUMMARY")
+
+print(f"VaG_MECP_electronic_cm1           : {VaG_MECP_electronic_cm1:.6f}")
+print(f"ZPE_REF_from_freq_cm1             : {ZPE_REF_from_freq_cm1:.6f}")
+print(f"ZPE_MECP_effhess_cm1              : {ZPE_MECP_effhess_cm1:.6f}")
+print(f"Delta_ZPE_MECP_minus_REF_cm1      : {Delta_ZPE_MECP_minus_REF_cm1:.6f}")
+print(f"VaG_MECP_cm1 active barrier       : {VaG_MECP_cm1:.6f}")
+print(f"reduced_mass_amu                  : {reduced_mass_amu:.8f}")
+print(f"GRADIENT_GAP_NORM_EH_PER_BOHR       : {GRADIENT_GAP_NORM_EH_PER_BOHR:.12e}")
+print(f"PROJECTED_GRADIENT_MEAN_EH_PER_BOHR              : {PROJECTED_GRADIENT_MEAN_EH_PER_BOHR:.12e}")
+print(f"Energy spacing               : {energy_step_cm1:.3f} cm^-1")
+print(f"Total-energy grid                  : {minimum_total_energy_cm1:.3f} to {E_max_cm1:.3f} cm^-1")
+print(f"Requested RC energy above MECP    : 0.000 to {maximum_reaction_coordinate_energy_cm1:.3f} cm^-1")
+print(f"Velocity                          : {np.nanmin(v_m_s):.6e} to {np.nanmax(v_m_s):.6e} m/s")
+print(f"Velocity                          : {np.nanmin(v_bohr_s):.6e} to {np.nanmax(v_bohr_s):.6e} Bohr/s")
+
+print("\nImportant variables available for later steps:")
+print("  VaG_MECP_electronic_cm1")
+print("  VaG_MECP_ZPE_corrected_cm1")
+print("  VaG_MECP_cm1")
+print("  VaG_MECP_kJmol")
+print("  ZPE_REF_from_freq_cm1")
+print("  ZPE_MECP_effhess_cm1")
+print("  Delta_ZPE_MECP_minus_REF_cm1")
+print("  energy_step_cm1")
+print("  maximum_energy_bin_index")
+print("  crossing_energy_bin_index")
+print("  total_energy_grid_cm1")
+print("  probability_energy_grid_cm1")
+print("  reaction_coordinate_excess_energy_cm1")
+print("  positive_reaction_coordinate_energy_cm1")
+print("  maximum_reaction_coordinate_energy_cm1")
+print("  energy_above_crossing_cm1")
+print("  energy_relative_to_crossing_cm1")
+print("  requested_maximum_total_energy_cm1")
+print("  E_max_cm1")
+print("  interoperability_maximum_energy_cm1")
+print("  v_m_s")
+print("  v_bohr_s")
+print("  v_bohr_s_safe")
+print("  reduced_mass_amu")
+print("  mu_kg")
+print("  GRADIENT_GAP_NORM_EH_PER_BOHR")
+print("  PROJECTED_GRADIENT_MEAN_EH_PER_BOHR")
+print("  summary_file_step7")
+print("  grid_file_step7")
+print("  velocity_plot_file")
+
+print("\nSTEP 7 COMPLETED SUCCESSFULLY.\n")
+
+#%% STEP 8. Local PC EFFECTIVE, INTERMEDIATE, AND MS-RESOLVED LZ/WC PROBABILITIES
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.special import airy
+
+print(r'''
+====================================================================
+ STEP 8 | LOCAL PC VERSION
+ Effective, intermediate, and Ms-resolved LZ/WC probabilities
+====================================================================
+
+Computes on the common 1 cm^-1 energy grid created in Step 7:
+
+  1. Effective LZ/WC probabilities using H_SO_cm
+  2. Intermediate LZ/WC probabilities from grouped SOC row norms
+  3. Ms-specific LZ/WC probabilities from individual SOC matrix elements
+
+The Step 7 total-energy and velocity arrays are used directly.
+Step 8 does not define a separate probability grid or velocity grid.
+
+Every nonzero Ms-specific channel is calculated independently.
+Channels with different |H_SO| values are retained as separate curves.
+Channels with numerically identical |H_SO| values generate identical
+probability curves, so only one representative curve is plotted for
+such symmetry-equivalent channels.
+
+No Ms-specific probabilities are summed.
+No weighted spin-projection sum is formed here.
+
+No SSH, no SFTP, no PBS/qsub, and no remote cluster directory are used.
+''')
+
+required_vars_step8 = [
+    "jobname",
+    "H_SO_cm",
+    "GRADIENT_GAP_NORM_EH_PER_BOHR",
+    "PROJECTED_GRADIENT_MEAN_EH_PER_BOHR",
+    "VaG_MECP_cm1",
+    "total_energy_grid_cm1",
+    "v_m_s",
+    "v_bohr_s",
+    "energy_step_cm1",
+    "maximum_energy_bin_index",
+    "crossing_energy_bin_index",
+    "reduced_mass_amu",
+    "local_base",
+    "remote_base"
+]
+
+for var in required_vars_step8:
+    if var not in globals():
+        raise RuntimeError(
+            f"Required variable '{var}' is missing. Run Local PC Steps 1–7 first."
+        )
+
+RUN_MODE = globals().get("RUN_MODE", "LOCAL")
+workflow_mode = "MECP_ONLY"
+
+
+def section(title):
+    print("\n" + "=" * 72)
+    print(f" {title}")
+    print("=" * 72 + "\n")
+
+
+def write_local_text(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+def spin_symbol(S_value):
+    S_round = round(float(S_value), 1)
+
+    spin_map = {
+        0.0: "S",
+        0.5: "D",
+        1.0: "T",
+        1.5: "Q",
+        2.0: "Qu",
+        2.5: "Se",
+        3.0: "Sep",
+        3.5: "Oct"
+    }
+
+    return spin_map.get(S_round, f"S={S_round}")
+
+
+def abs_ms_label(Ms_abs):
+    Ms_abs = float(Ms_abs)
+
+    if abs(Ms_abs - round(Ms_abs)) < 1.0e-8:
+        return str(int(round(Ms_abs)))
+
+    return f"{Ms_abs:.1f}".replace(".", "p")
+
+
+def ms_tex_value(x):
+    x = float(x)
+
+    if abs(x - round(x)) < 1.0e-8:
+        return str(int(round(x)))
+
+    if abs(abs(x) - 0.5) < 1.0e-8:
+        return r"\frac{1}{2}" if x > 0 else r"-\frac{1}{2}"
+
+    if abs(abs(x) - 1.5) < 1.0e-8:
+        return r"\frac{3}{2}" if x > 0 else r"-\frac{3}{2}"
+
+    if abs(abs(x) - 2.5) < 1.0e-8:
+        return r"\frac{5}{2}" if x > 0 else r"-\frac{5}{2}"
+
+    if abs(abs(x) - 3.5) < 1.0e-8:
+        return r"\frac{7}{2}" if x > 0 else r"-\frac{7}{2}"
+
+    return f"{x:.1f}"
+
+
+def channel_tex_label(Ms_low_value, Ms_high_value):
+    return (
+        r"$P^{"
+        + ms_tex_value(Ms_low_value)
+        + ","
+        + ms_tex_value(Ms_high_value)
+        + r"}$"
+    )
+
+
+def make_group_channel_legend(prefix, group_data):
+    """
+    Build a legend for one representative MS-specific probability curve.
+
+    Multiple channel symbols indicate symmetry-equivalent channels with
+    identical |H_SO| values and therefore identical probabilities.
+    Commas indicate coincident curves; no summation is implied.
+    """
+    symbols = list(group_data.get("channel_symbols", []))
+    H_abs = float(group_data["H_abs_cm1"])
+
+    if len(symbols) == 0:
+        return rf"{prefix} MS ($|H_{{\mathrm{{SO}}}}|$={H_abs:.1f})"
+
+    if len(symbols) <= 3:
+        joined = ", ".join(symbols)
+        return rf"{prefix} {joined} ($|H_{{\mathrm{{SO}}}}|$={H_abs:.1f})"
+
+    joined = ", ".join(symbols[:3]) + ", ..."
+    return (
+        rf"{prefix} {joined} ($|H_{{\mathrm{{SO}}}}|$={H_abs:.1f}), "
+        f"equivalent channels={len(symbols)}"
+    )
+
+
+# ============================================================
+# Constants and active quantities
+# ============================================================
+
+section("STEP 8 CONSTANTS AND ACTIVE INPUTS")
+
+h_SI = 6.62607015e-34
+c_SI = 2.99792458e8
+Eh_to_J = 4.3597447222071e-18
+autocm = 219474.6313705
+amu_to_kg = 1.66053906660e-27
+amu_to_au = 1822.8884853323708
+bohr_m = 5.29177210903e-11
+
+# Use the Step 7 common energy grid directly.
+total_energy_grid_cm1 = np.asarray(total_energy_grid_cm1, dtype=float).reshape(-1)
+probability_energy_grid_cm1 = total_energy_grid_cm1.copy()
+
+v_m_s_step7 = np.asarray(v_m_s, dtype=float).reshape(-1)
+v_bohr_s_step7 = np.asarray(v_bohr_s, dtype=float).reshape(-1)
+
+E_MECP_cm1 = float(VaG_MECP_cm1)
+E_MECP = E_MECP_cm1
+
+gradient_gap_magnitude = abs(float(GRADIENT_GAP_NORM_EH_PER_BOHR))
+projected_gradient_mean = abs(float(PROJECTED_GRADIENT_MEAN_EH_PER_BOHR))
+
+mu_kg = float(reduced_mass_amu) * amu_to_kg
+mu_au = float(reduced_mass_amu) * amu_to_au
+
+energy_step_cm1 = float(energy_step_cm1)
+maximum_energy_bin_index = int(maximum_energy_bin_index)
+crossing_energy_bin_index = int(crossing_energy_bin_index)
+
+if total_energy_grid_cm1.size == 0:
+    raise RuntimeError("total_energy_grid_cm1 is empty. Run the modified Step 7 first.")
+
+if total_energy_grid_cm1.size != maximum_energy_bin_index + 1:
+    raise RuntimeError(
+        f"total_energy_grid_cm1 has length {total_energy_grid_cm1.size}, "
+        f"but maximum_energy_bin_index + 1 is {maximum_energy_bin_index + 1}."
+    )
+
+if v_m_s_step7.size != total_energy_grid_cm1.size:
+    raise RuntimeError(
+        "Step 7 v_m_s length does not match total_energy_grid_cm1."
+    )
+
+if v_bohr_s_step7.size != total_energy_grid_cm1.size:
+    raise RuntimeError(
+        "Step 7 v_bohr_s length does not match total_energy_grid_cm1."
+    )
+
+if energy_step_cm1 <= 0.0 or not np.isfinite(energy_step_cm1):
+    raise RuntimeError("Invalid energy_step_cm1 from Step 7.")
+
+expected_grid = np.arange(maximum_energy_bin_index + 1, dtype=float) * energy_step_cm1
+
+if not np.allclose(total_energy_grid_cm1, expected_grid, rtol=0.0, atol=1.0e-12):
+    raise RuntimeError(
+        "total_energy_grid_cm1 is not the common uniform common energy grid from Step 7."
+    )
+
+expected_binX = int(np.ceil(E_MECP_cm1 / energy_step_cm1))
+
+if crossing_energy_bin_index != expected_binX:
+    raise RuntimeError(
+        f"Step 7 crossing_energy_bin_index={crossing_energy_bin_index}, but ceil(E_MECP/energy_step_cm1)={expected_binX}."
+    )
+
+if gradient_gap_magnitude <= 0.0 or not np.isfinite(gradient_gap_magnitude):
+    raise RuntimeError("Invalid GRADIENT_GAP_NORM_EH_PER_BOHR.")
+
+if projected_gradient_mean <= 0.0 or not np.isfinite(projected_gradient_mean):
+    raise RuntimeError("Invalid PROJECTED_GRADIENT_MEAN_EH_PER_BOHR.")
+
+if mu_kg <= 0.0 or not np.isfinite(mu_kg):
+    raise RuntimeError("Invalid reduced_mass_amu.")
+
+velocity_floor = float(globals().get("velocity_floor", 1.0e-12))
+
+# Independent consistency check using the exact Step 9 velocity definition.
+E_excess_J_check = (
+    (total_energy_grid_cm1 - E_MECP_cm1)
+    * 100.0
+    * h_SI
+    * c_SI
+)
+
+v_m_s_check = np.zeros_like(total_energy_grid_cm1)
+mask_velocity_check = E_excess_J_check > 0.0
+
+v_m_s_check[mask_velocity_check] = np.sqrt(
+    2.0 * E_excess_J_check[mask_velocity_check] / mu_kg
+)
+
+v_bohr_s_check = v_m_s_check / bohr_m
+
+if not np.allclose(
+    v_m_s_step7,
+    v_m_s_check,
+    rtol=1.0e-12,
+    atol=1.0e-12
+):
+    raise RuntimeError(
+        "Step 7 v_m_s does not match the Step 9 velocity definition."
+    )
+
+if not np.allclose(
+    v_bohr_s_step7,
+    v_bohr_s_check,
+    rtol=1.0e-12,
+    atol=1.0e-6
+):
+    raise RuntimeError(
+        "Step 7 v_bohr_s does not match the Step 9 velocity definition."
+    )
+
+# These are the authoritative velocity arrays used throughout Step 8.
+v_m_s = v_m_s_step7.copy()
+v_bohr_s = v_bohr_s_step7.copy()
+
+print(f"RUN_MODE                         : {RUN_MODE}")
+print(f"workflow_mode                    : {workflow_mode}")
+print(f"H_SO_cm effective                : {float(H_SO_cm):.12f} cm^-1")
+print(f"E_MECP_cm1 active threshold      : {E_MECP_cm1:.12f} cm^-1")
+print(f"energy_step_cm1                            : {energy_step_cm1:.6f} cm^-1")
+print(f"maximum_energy_bin_index                          : {maximum_energy_bin_index}")
+print(f"crossing_energy_bin_index                             : {crossing_energy_bin_index}")
+print(f"gradient_gap_magnitude                  : {gradient_gap_magnitude:.12e} Eh/Bohr")
+print(f"projected_gradient_mean                         : {projected_gradient_mean:.12e} Eh/Bohr")
+print(f"reduced_mass_amu                 : {float(reduced_mass_amu):.8f} amu")
+print(f"mu_kg                            : {mu_kg:.12e} kg")
+print(f"mu_au                            : {mu_au:.12e} a.u.")
+print(f"Energy grid points               : {total_energy_grid_cm1.size}")
+print(
+    f"Energy grid range                : "
+    f"{total_energy_grid_cm1[0]:.6f} to {total_energy_grid_cm1[-1]:.6f} cm^-1"
+)
+print("Velocity source                  : Step 7 common common energy grid")
+print("Velocity consistency check       : PASSED")
+
+
+# ============================================================
+# Probability functions
+# ============================================================
+
+def compute_LZ_for_HSO_cm(
+    H_cm,
+    E_grid_cm1=None,
+    v_bohr_s_grid=None,
+    v_m_s_grid=None
+):
+    """
+    Compute an LZ probability on a supplied energy/velocity grid.
+
+    By default, this function uses the common Step 7 common energy grid and the
+    Step 7 velocity arrays directly. A custom grid is accepted only when
+    matching velocity arrays are supplied explicitly.
+    """
+    if E_grid_cm1 is None:
+        E_grid_cm1 = total_energy_grid_cm1
+        v_bohr_s_grid = v_bohr_s
+        v_m_s_grid = v_m_s
+
+    else:
+        E_grid_cm1 = np.asarray(
+            E_grid_cm1,
+            dtype=float
+        ).reshape(-1)
+
+        if v_bohr_s_grid is None or v_m_s_grid is None:
+            raise ValueError(
+                "A custom energy grid requires matching v_bohr_s_grid "
+                "and v_m_s_grid arrays. Step 8 does not independently "
+                "redefine velocity."
+            )
+
+        v_bohr_s_grid = np.asarray(
+            v_bohr_s_grid,
+            dtype=float
+        ).reshape(-1)
+
+        v_m_s_grid = np.asarray(
+            v_m_s_grid,
+            dtype=float
+        ).reshape(-1)
+
+    if E_grid_cm1.size != v_bohr_s_grid.size:
+        raise ValueError(
+            "Energy and Bohr/s velocity arrays have different lengths."
+        )
+
+    if E_grid_cm1.size != v_m_s_grid.size:
+        raise ValueError(
+            "Energy and m/s velocity arrays have different lengths."
+        )
+
+    H_cm = float(abs(H_cm))
+    H_J = h_SI * c_SI * H_cm * 100.0
+
+    P = np.zeros_like(E_grid_cm1, dtype=float)
+    gamma = np.full_like(E_grid_cm1, np.nan, dtype=float)
+
+    mask = (
+        np.isfinite(E_grid_cm1)
+        & np.isfinite(v_bohr_s_grid)
+        & (E_grid_cm1 >= E_MECP_cm1)
+        & (v_bohr_s_grid > velocity_floor)
+    )
+
+    dDeltaE_dt_Eh_s = gradient_gap_magnitude * v_bohr_s_grid
+    dDeltaE_dt_J_s = dDeltaE_dt_Eh_s * Eh_to_J
+
+    gamma[mask] = (
+        4.0 * np.pi**2 * H_J**2
+        / (h_SI * dDeltaE_dt_J_s[mask])
+    )
+
+    P[mask] = 1.0 - np.exp(-2.0 * gamma[mask])
+    P[~np.isfinite(P)] = 0.0
+    P = np.clip(P, 0.0, 1.0)
+
+    return (
+        P,
+        gamma,
+        np.asarray(v_bohr_s_grid, dtype=float).copy(),
+        np.asarray(v_m_s_grid, dtype=float).copy()
+    )
+
+
+def compute_WC_for_HSO_cm(H_cm, E_grid_cm1=None):
+    if E_grid_cm1 is None:
+        E_grid_cm1 = total_energy_grid_cm1
+
+    E_grid_cm1 = np.asarray(E_grid_cm1, dtype=float).reshape(-1)
+
+    H_Eh = float(abs(H_cm)) / autocm
+    E_excess_Eh = (E_grid_cm1 - E_MECP_cm1) / autocm
+
+    P = np.zeros_like(E_grid_cm1)
+    airy_arg = np.full_like(E_grid_cm1, np.nan)
+    Ai = np.full_like(E_grid_cm1, np.nan)
+
+    mask = (
+        np.isfinite(E_grid_cm1)
+        & np.isfinite(E_excess_Eh)
+    )
+
+    prefactor = (
+        4.0
+        * np.pi**2
+        * H_Eh**2
+        * (
+            2.0 * mu_au
+            / (projected_gradient_mean * gradient_gap_magnitude)
+        ) ** (2.0 / 3.0)
+    )
+
+    scale = (
+        2.0
+        * mu_au
+        * gradient_gap_magnitude**2
+        / projected_gradient_mean**4
+    ) ** (1.0 / 3.0)
+
+    airy_arg[mask] = -E_excess_Eh[mask] * scale
+    Ai[mask] = airy(airy_arg[mask])[0]
+
+    P[mask] = prefactor * Ai[mask] ** 2
+    P[~np.isfinite(P)] = 0.0
+    P = np.clip(P, 0.0, 1.0)
+
+    return P, airy_arg, Ai
+
+
+# ============================================================
+# Effective probabilities
+# ============================================================
+
+section("EFFECTIVE LZ/WC PROBABILITIES")
+
+P_LZ_effective, gamma_LZ_effective, v_bohr_s, v_m_s = (
+    compute_LZ_for_HSO_cm(H_SO_cm)
+)
+
+P_WC_effective, airy_arg_WC_effective, Ai_WC_effective = (
+    compute_WC_for_HSO_cm(H_SO_cm)
+)
+
+P_LZ_micro = P_LZ_effective
+gamma_LZ = gamma_LZ_effective
+P_WC_micro = P_WC_effective
+
+effective_LZ_probability = P_LZ_effective
+effective_LZ_gamma = gamma_LZ_effective
+effective_WC_probability = P_WC_effective
+effective_WC_airy_argument = airy_arg_WC_effective
+effective_WC_airy_value = Ai_WC_effective
+rate_velocity_bohr_s = v_bohr_s.copy()
+
+print(f"P_LZ_effective range             : {np.nanmin(P_LZ_effective):.6e} to {np.nanmax(P_LZ_effective):.6e}")
+print(f"P_WC_effective range             : {np.nanmin(P_WC_effective):.6e} to {np.nanmax(P_WC_effective):.6e}")
+
+
+# ============================================================
+# Ms-resolved + intermediate probabilities
+# ============================================================
+
+section("MS-RESOLVED AND INTERMEDIATE PROBABILITIES")
+
+P_LZ_channels = {}
+P_LZ_channel_groups = {}
+
+P_WC_channels = {}
+P_WC_channel_groups = {}
+
+P_LZ_intermediate = {}
+P_WC_intermediate = {}
+
+# Channels are considered symmetry-equivalent only when their |H_SO|
+# values agree within this tight numerical tolerance. No decimal rounding
+# is used to decide equivalence.
+MS_CHANNEL_GROUP_ATOL_CM1 = float(
+    globals().get("MS_CHANNEL_GROUP_ATOL_CM1", 1.0e-8)
+)
+MS_CHANNEL_GROUP_RTOL = float(
+    globals().get("MS_CHANNEL_GROUP_RTOL", 1.0e-10)
+)
+
+SOC_EFFECTIVE_ONLY = bool(globals().get("SOC_EFFECTIVE_ONLY", False))
+SOC_MATRIX_CHANNELS_AVAILABLE = bool(globals().get("SOC_MATRIX_CHANNELS_AVAILABLE", True))
+
+if SOC_EFFECTIVE_ONLY or not SOC_MATRIX_CHANNELS_AVAILABLE:
+    SOC_channel_matrix_cm1 = None
+    SOC_channel_matrix_label = "effective-only scalar SOC"
+
+    print("Effective-only SOC mode detected.")
+    print("MS-specific and intermediate probability curves will not be generated.")
+
+else:
+    if "SOC_Ms_matrix_scaled_cm1" in globals():
+        SOC_channel_matrix_cm1 = np.asarray(
+            SOC_Ms_matrix_scaled_cm1,
+            dtype=complex
+        )
+        SOC_channel_matrix_label = "SOC_Ms_matrix_scaled_cm1"
+
+    elif "SOC_Ms_matrix_cm1" in globals():
+        SOC_channel_matrix_cm1 = np.asarray(
+            SOC_Ms_matrix_cm1,
+            dtype=complex
+        )
+        SOC_channel_matrix_label = "SOC_Ms_matrix_cm1"
+
+    else:
+        SOC_channel_matrix_cm1 = None
+        SOC_channel_matrix_label = None
+
+if SOC_channel_matrix_cm1 is not None:
+
+    if "Ms_low" not in globals() or "Ms_high" not in globals():
+        raise RuntimeError("Ms_low/Ms_high are missing. Run Local PC Step 2 first.")
+
+    if "S_low" not in globals() or "S_high" not in globals():
+        raise RuntimeError("S_low/S_high are missing. Run Local PC Step 2 first.")
+
+    Ms_low = np.asarray(Ms_low, dtype=float)
+    Ms_high = np.asarray(Ms_high, dtype=float)
+
+    if SOC_channel_matrix_cm1.shape != (len(Ms_low), len(Ms_high)):
+        raise RuntimeError(
+            "SOC matrix shape does not match Ms_low/Ms_high dimensions: "
+            f"{SOC_channel_matrix_cm1.shape} vs ({len(Ms_low)}, {len(Ms_high)})."
+        )
+
+    # --------------------------------------------------------
+    # MS-specific probabilities
+    # --------------------------------------------------------
+    for i, Ms_i in enumerate(Ms_low):
+        for j, Ms_j in enumerate(Ms_high):
+
+            H_ij = SOC_channel_matrix_cm1[i, j]
+            H_abs = float(abs(H_ij))
+
+            if H_abs <= 1.0e-10:
+                continue
+
+            channel_symbol = channel_tex_label(Ms_i, Ms_j)
+
+            label = (
+                f"S{S_low:.1f}_Ms{Ms_i:+.1f}"
+                f"__S{S_high:.1f}_Ms{Ms_j:+.1f}"
+            )
+
+            P_lz_ij, gamma_lz_ij, _, _ = compute_LZ_for_HSO_cm(H_abs)
+            P_wc_ij, airy_arg_wc_ij, Ai_wc_ij = compute_WC_for_HSO_cm(H_abs)
+
+            P_LZ_channels[label] = {
+                "P": P_lz_ij,
+                "gamma": gamma_lz_ij,
+                "H_complex_cm1": H_ij,
+                "H_abs_cm1": H_abs,
+                "S_low": S_low,
+                "S_high": S_high,
+                "Ms_low": Ms_i,
+                "Ms_high": Ms_j,
+                "matrix_index": (i, j),
+                "source_matrix": SOC_channel_matrix_label,
+                "channel_symbol": channel_symbol
+            }
+
+            P_WC_channels[label] = {
+                "P": P_wc_ij,
+                "airy_arg": airy_arg_wc_ij,
+                "Ai": Ai_wc_ij,
+                "H_complex_cm1": H_ij,
+                "H_abs_cm1": H_abs,
+                "S_low": S_low,
+                "S_high": S_high,
+                "Ms_low": Ms_i,
+                "Ms_high": Ms_j,
+                "matrix_index": (i, j),
+                "source_matrix": SOC_channel_matrix_label,
+                "channel_symbol": channel_symbol
+            }
+
+    # --------------------------------------------------------
+    # Symmetry-equivalent MS-specific channel groups
+    # --------------------------------------------------------
+    # Every channel remains available in P_LZ_channels/P_WC_channels.
+    # For plotting, channels are collapsed only when their |H_SO| values
+    # are numerically identical within the strict tolerance above.
+    # The stored curve is a single representative curve; nothing is summed.
+
+    def assign_channel_to_representative_group(
+        groups,
+        label,
+        data
+    ):
+        H_abs = float(data["H_abs_cm1"])
+
+        matching_key = None
+        for existing_key, existing_data in groups.items():
+            if np.isclose(
+                H_abs,
+                float(existing_data["H_abs_cm1"]),
+                rtol=MS_CHANNEL_GROUP_RTOL,
+                atol=MS_CHANNEL_GROUP_ATOL_CM1
+            ):
+                matching_key = existing_key
+                break
+
+        if matching_key is None:
+            matching_key = f"MS_group_{len(groups) + 1:03d}"
+
+            groups[matching_key] = {
+                "H_abs_cm1": H_abs,
+                "labels": [],
+                "channel_symbols": [],
+                "representative_label": label,
+                "P_representative": np.asarray(
+                    data["P"],
+                    dtype=float
+                ).copy(),
+                "degeneracy": 0,
+                "multiplicity": 0,
+                "source_matrix": SOC_channel_matrix_label,
+                "combination_rule": "representative_only_no_sum"
+            }
+
+        groups[matching_key]["labels"].append(label)
+        groups[matching_key]["channel_symbols"].append(
+            data["channel_symbol"]
+        )
+        groups[matching_key]["degeneracy"] += 1
+        groups[matching_key]["multiplicity"] += 1
+
+    for label, data in P_LZ_channels.items():
+        assign_channel_to_representative_group(
+            P_LZ_channel_groups,
+            label,
+            data
+        )
+
+    for label, data in P_WC_channels.items():
+        assign_channel_to_representative_group(
+            P_WC_channel_groups,
+            label,
+            data
+        )
+
+    # --------------------------------------------------------
+    # Intermediate probabilities
+    # One curve per unique |Ms_low| group.
+    # No weighted sum is computed here.
+    # --------------------------------------------------------
+    abs_ms_groups = sorted(set([round(abs(float(x)), 8) for x in Ms_low]))
+
+    for abs_Ms in abs_ms_groups:
+        row_indices = [
+            i for i, Ms_i in enumerate(Ms_low)
+            if abs(abs(float(Ms_i)) - abs_Ms) < 1.0e-8
+        ]
+
+        H_rows = []
+
+        for i in row_indices:
+            row = SOC_channel_matrix_cm1[i, :]
+            H_row = float(np.sqrt(np.sum(np.abs(row) ** 2)))
+            H_rows.append(H_row)
+
+        H_rows = np.asarray(H_rows, dtype=float)
+        H_rows = H_rows[np.isfinite(H_rows) & (H_rows > 1.0e-10)]
+
+        if H_rows.size == 0:
+            continue
+
+        H_int = float(np.sqrt(np.mean(H_rows ** 2)))
+
+        label = f"INT_absMs{abs_ms_label(abs_Ms)}"
+
+        P_lz_int, gamma_lz_int, _, _ = compute_LZ_for_HSO_cm(H_int)
+        P_wc_int, airy_arg_wc_int, Ai_wc_int = compute_WC_for_HSO_cm(H_int)
+
+        P_LZ_intermediate[label] = {
+            "P": P_lz_int,
+            "gamma": gamma_lz_int,
+            "H_int_cm1": H_int,
+            "H_rows_cm1": H_rows,
+            "abs_Ms_low": abs_Ms,
+            "degeneracy": len(row_indices),
+            "row_indices": row_indices,
+            "source_matrix": SOC_channel_matrix_label
+        }
+
+        P_WC_intermediate[label] = {
+            "P": P_wc_int,
+            "airy_arg": airy_arg_wc_int,
+            "Ai": Ai_wc_int,
+            "H_int_cm1": H_int,
+            "H_rows_cm1": H_rows,
+            "abs_Ms_low": abs_Ms,
+            "degeneracy": len(row_indices),
+            "row_indices": row_indices,
+            "source_matrix": SOC_channel_matrix_label
+        }
+
+    print(f"SOC channel matrix source          : {SOC_channel_matrix_label}")
+    print(f"Nonzero Ms-resolved channels       : {len(P_LZ_channels)}")
+    print(f"Representative unique |H_SO| curves: {len(P_LZ_channel_groups)}")
+    print(f"Intermediate |Ms_low| curves       : {len(P_LZ_intermediate)}")
+
+    if P_LZ_intermediate:
+        print("\nIntermediate SOC values:")
+        for key, data in sorted(
+            P_LZ_intermediate.items(),
+            key=lambda x: x[1]["abs_Ms_low"]
+        ):
+            print(
+                f"  {key:14s}  |Ms_low| = {data['abs_Ms_low']:.3f}  "
+                f"deg = {data['degeneracy']:2d}  "
+                f"H_int = {data['H_int_cm1']:.6f} cm^-1"
+            )
+
+    if P_LZ_channel_groups:
+        print("\nRepresentative MS-specific channel probabilities (no summation):")
+        for key, data in sorted(
+            P_LZ_channel_groups.items(),
+            key=lambda x: x[1]["H_abs_cm1"],
+            reverse=True
+        ):
+            readable = ", ".join(data["channel_symbols"])
+            print(
+                f"  {key:12s}  {readable:30s}  "
+                f"|H| = {data['H_abs_cm1']:.6f} cm^-1"
+            )
+
+else:
+    print("No Ms-resolved SOC matrix found. Only effective probabilities were calculated.")
+
+
+# ============================================================
+# Plot probability curves
+# ============================================================
+
+section("PLOTTING STEP 8 PROBABILITY CURVES")
+
+local_step8 = os.path.join(local_base, "LZ_WC_probabilities")
+os.makedirs(local_step8, exist_ok=True)
+
+# Local PC compatibility alias. No remote directory is created.
+# The remote_* name is retained for compatibility with shared later steps.
+remote_step8 = local_step8
+
+lz_plot_file_step8 = os.path.join(
+    local_step8,
+    "Step8_LZ_probabilities.png"
+)
+
+wc_plot_file_step8 = os.path.join(
+    local_step8,
+    "Step8_WC_probabilities.png"
+)
+
+# Use the actual common external interoperability probability arrays. No separate plotting
+# grid and no separate velocity calculation are introduced.
+lz_plot_min_cm1 = max(
+    float(total_energy_grid_cm1[0]),
+    E_MECP_cm1 - 1000.0
+)
+
+wc_plot_min_cm1 = max(
+    float(total_energy_grid_cm1[0]),
+    E_MECP_cm1 - 1500.0
+)
+
+mask_plot_lz = total_energy_grid_cm1 >= lz_plot_min_cm1
+mask_plot_wc = total_energy_grid_cm1 >= wc_plot_min_cm1
+
+# ----------------------------
+# LZ plot
+# ----------------------------
+plt.figure(figsize=(9.2, 5.2))
+
+plt.plot(
+    total_energy_grid_cm1[mask_plot_lz],
+    P_LZ_effective[mask_plot_lz],
+    color="k",
+    linestyle=":",
+    linewidth=2.5,
+    label=rf"LZ $P^{{eff}}$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+)
+
+if P_LZ_intermediate:
+    for key, data in sorted(
+        P_LZ_intermediate.items(),
+        key=lambda x: x[1]["abs_Ms_low"]
+    ):
+        plt.plot(
+            total_energy_grid_cm1[mask_plot_lz],
+            data["P"][mask_plot_lz],
+            linewidth=2.0,
+            linestyle="--",
+            label=(
+                f"LZ $P^{{{ms_tex_value(data['abs_Ms_low'])}}}$ "
+                rf"($H_{{\mathrm{{SO}}}}^{{int}}$={data['H_int_cm1']:.1f})"
+            )
+        )
+
+if P_LZ_channel_groups:
+    for key, data in sorted(
+        P_LZ_channel_groups.items(),
+        key=lambda x: x[1]["H_abs_cm1"],
+        reverse=True
+    ):
+        plt.plot(
+            total_energy_grid_cm1[mask_plot_lz],
+            data["P_representative"][mask_plot_lz],
+            linewidth=1.4,
+            label=make_group_channel_legend("LZ", data)
+        )
+
+plt.axvline(
+    E_MECP_cm1,
+    color="k",
+    linestyle="--",
+    linewidth=1.5,
+    label="ZPE-corrected MECP"
+)
+
+plt.xlabel("Total energy relative to reference minimum (cm$^{-1}$)", fontsize=12)
+plt.ylabel("Landau-Zener probability", fontsize=12)
+plt.title("Effective, Intermediate, and MS-specific LZ Probabilities", fontsize=14)
+plt.tick_params(axis="both", labelsize=12)
+plt.grid(False)
+plt.legend()
+plt.tight_layout()
+plt.savefig(lz_plot_file_step8, dpi=300)
+plt.show()
+
+# ----------------------------
+# WC plot
+# ----------------------------
+plt.figure(figsize=(9.2, 5.2))
+
+plt.plot(
+    total_energy_grid_cm1[mask_plot_wc],
+    P_WC_effective[mask_plot_wc],
+    color="k",
+    linestyle=":",
+    linewidth=2.5,
+    label=rf"WC $P^{{eff}}$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+)
+
+if P_WC_intermediate:
+    for key, data in sorted(
+        P_WC_intermediate.items(),
+        key=lambda x: x[1]["abs_Ms_low"]
+    ):
+        plt.plot(
+            total_energy_grid_cm1[mask_plot_wc],
+            data["P"][mask_plot_wc],
+            linewidth=2.0,
+            linestyle="--",
+            label=(
+                f"WC $P^{{{ms_tex_value(data['abs_Ms_low'])}}}$ "
+                rf"($H_{{\mathrm{{SO}}}}^{{int}}$={data['H_int_cm1']:.1f})"
+            )
+        )
+
+if P_WC_channel_groups:
+    for key, data in sorted(
+        P_WC_channel_groups.items(),
+        key=lambda x: x[1]["H_abs_cm1"],
+        reverse=True
+    ):
+        plt.plot(
+            total_energy_grid_cm1[mask_plot_wc],
+            data["P_representative"][mask_plot_wc],
+            linewidth=1.4,
+            label=make_group_channel_legend("WC", data)
+        )
+
+plt.axvline(
+    E_MECP_cm1,
+    color="k",
+    linestyle="--",
+    linewidth=1.5,
+    label="ZPE-corrected MECP"
+)
+
+plt.xlabel("Total energy relative to reference minimum (cm$^{-1}$)", fontsize=12)
+plt.ylabel("Weak-coupling probability", fontsize=12)
+plt.title("Effective, Intermediate, and MS-specific WC Probabilities", fontsize=14)
+plt.tick_params(axis="both", labelsize=12)
+plt.grid(False)
+plt.legend()
+plt.tight_layout()
+plt.savefig(wc_plot_file_step8, dpi=300)
+plt.show()
+
+print(f"LZ probability plot saved locally : {lz_plot_file_step8}")
+print(f"WC probability plot saved locally : {wc_plot_file_step8}")
+
+
+# ============================================================
+# Reader-facing formatting for MS-specific channel labels in .txt files
+# ============================================================
+
+def _fmt_ms_channel_spin_number_for_text(value_text, signed=False):
+    """
+    Format S or Ms values for reader-facing text only.
+    Internal channel keys and scientific variables are not changed.
+    """
+    value = float(value_text)
+
+    if abs(value - round(value)) < 1.0e-10:
+        body = str(int(round(value)))
+    else:
+        body = f"{value:g}"
+
+    if signed and value > 0.0:
+        body = "+" + body
+
+    return body
+
+
+def format_ms_channel_label_for_text(channel_label):
+    """
+    Convert internal MS-channel labels such as
+
+        S0.0_Ms+0.0__S1.0_Ms+1.0
+        S0.0_Ms+0.0_to_S1.0_Ms+1.0
+
+    to the reader-facing form
+
+        (S=0,Ms=0) to (S'=1,M's=+1)
+
+    This function is used only when writing SPINKS .txt output files.
+    Internal dictionary keys, calculations, plotting data, and variables
+    remain unchanged.
+    """
+    label = str(channel_label)
+
+    try:
+        if "__" in label:
+            left, right = label.split("__", 1)
+        elif "_to_" in label:
+            left, right = label.split("_to_", 1)
+        else:
+            return label
+
+        s_left_text, ms_left_text = left[1:].split("_Ms", 1)
+        s_right_text, ms_right_text = right[1:].split("_Ms", 1)
+
+        s_left = _fmt_ms_channel_spin_number_for_text(s_left_text)
+        ms_left = _fmt_ms_channel_spin_number_for_text(ms_left_text, signed=True)
+        s_right = _fmt_ms_channel_spin_number_for_text(s_right_text)
+        ms_right = _fmt_ms_channel_spin_number_for_text(ms_right_text, signed=True)
+
+        return (
+            f"(S={s_left},Ms={ms_left}) to "
+            f"(S'={s_right},M's={ms_right})"
+        )
+
+    except Exception:
+        return label
+
+
+# ============================================================
+# Save Step 8 numerical outputs
+# ============================================================
+
+section("SAVING STEP 8 OUTPUTS")
+
+summary_file_step8 = os.path.join(
+    local_step8,
+    "Step8_probability_summary.txt"
+)
+
+effective_grid_file_step8 = os.path.join(
+    local_step8,
+    "Step8_effective_probability_grid.txt"
+)
+
+channel_summary_file_step8 = os.path.join(
+    local_step8,
+    "Step8_channel_probability_summary.txt"
+)
+
+intermediate_summary_file_step8 = os.path.join(
+    local_step8,
+    "Step8_intermediate_probability_summary.txt"
+)
+
+summary_lines = []
+
+summary_lines.append("Step 8 effective, intermediate, and Ms-resolved LZ/WC probabilities")
+summary_lines.append(f"Run mode = {RUN_MODE}")
+summary_lines.append(f"Workflow mode = {workflow_mode}")
+summary_lines.append("")
+summary_lines.append("[ACTIVE_INPUTS]")
+summary_lines.append(f"H_SO_cm = {float(H_SO_cm):.12f}")
+summary_lines.append(f"E_MECP_cm1 = {E_MECP_cm1:.12f}")
+summary_lines.append(f"VaG_MECP_cm1 = {float(VaG_MECP_cm1):.12f}")
+summary_lines.append(f"GRADIENT_GAP_NORM_EH_PER_BOHR = {gradient_gap_magnitude:.12e}")
+summary_lines.append(f"PROJECTED_GRADIENT_MEAN_EH_PER_BOHR = {projected_gradient_mean:.12e}")
+summary_lines.append(f"reduced_mass_amu = {float(reduced_mass_amu):.12f}")
+summary_lines.append(f"mu_kg = {mu_kg:.12e}")
+summary_lines.append(f"mu_au = {mu_au:.12e}")
+summary_lines.append(f"energy_step_cm1 = {energy_step_cm1:.12f}")
+summary_lines.append(f"maximum_energy_bin_index = {maximum_energy_bin_index}")
+summary_lines.append(f"crossing_energy_bin_index = {crossing_energy_bin_index}")
+summary_lines.append(f"energy_grid_source = Step 7 total_energy_grid_cm1")
+summary_lines.append(f"velocity_source = Step 7 v_m_s and v_bohr_s")
+summary_lines.append("")
+summary_lines.append("[EFFECTIVE_PROBABILITY_RANGES]")
+summary_lines.append(f"P_LZ_effective_min = {np.nanmin(P_LZ_effective):.12e}")
+summary_lines.append(f"P_LZ_effective_max = {np.nanmax(P_LZ_effective):.12e}")
+summary_lines.append(f"P_WC_effective_min = {np.nanmin(P_WC_effective):.12e}")
+summary_lines.append(f"P_WC_effective_max = {np.nanmax(P_WC_effective):.12e}")
+summary_lines.append("")
+summary_lines.append("[INTERMEDIATE]")
+summary_lines.append(f"intermediate_LZ_curves = {len(P_LZ_intermediate)}")
+summary_lines.append(f"intermediate_WC_curves = {len(P_WC_intermediate)}")
+summary_lines.append("")
+summary_lines.append("[MS_SPECIFIC_CHANNELS_NO_SUM]")
+summary_lines.append(f"SOC_channel_matrix_label = {SOC_channel_matrix_label}")
+summary_lines.append("channel_group_rule = representative_only_no_sum")
+summary_lines.append(f"nonzero_LZ_channels = {len(P_LZ_channels)}")
+summary_lines.append(f"representative_LZ_channel_groups = {len(P_LZ_channel_groups)}")
+summary_lines.append(f"nonzero_WC_channels = {len(P_WC_channels)}")
+summary_lines.append(f"representative_WC_channel_groups = {len(P_WC_channel_groups)}")
+summary_lines.append("")
+summary_lines.append("[FILES]")
+summary_lines.append(f"effective_grid_file_step8 = {effective_grid_file_step8}")
+summary_lines.append(f"intermediate_summary_file_step8 = {intermediate_summary_file_step8}")
+summary_lines.append(f"channel_summary_file_step8 = {channel_summary_file_step8}")
+summary_lines.append(f"lz_plot_file_step8 = {lz_plot_file_step8}")
+summary_lines.append(f"wc_plot_file_step8 = {wc_plot_file_step8}")
+
+write_local_text(summary_file_step8, "\n".join(summary_lines) + "\n")
+
+grid_lines = []
+grid_lines.append(
+    "total_energy_grid_cm1  E_minus_MECP_cm1  v_m_s  v_bohr_s  "
+    "P_LZ_effective  gamma_LZ_effective  P_WC_effective  "
+    "airy_arg_WC_effective  Ai_WC_effective"
+)
+
+for E, vm, vb, Plz, gam, Pwc, arg, ai in zip(
+    total_energy_grid_cm1,
+    v_m_s,
+    v_bohr_s,
+    P_LZ_effective,
+    gamma_LZ_effective,
+    P_WC_effective,
+    airy_arg_WC_effective,
+    Ai_WC_effective
+):
+    grid_lines.append(
+        f"{E:18.10f} "
+        f"{(E - E_MECP_cm1):18.10f} "
+        f"{vm:18.10e} "
+        f"{vb:18.10e} "
+        f"{Plz:18.10e} "
+        f"{gam:18.10e} "
+        f"{Pwc:18.10e} "
+        f"{arg:18.10e} "
+        f"{ai:18.10e}"
+    )
+
+write_local_text(effective_grid_file_step8, "\n".join(grid_lines) + "\n")
+
+intermediate_lines = []
+intermediate_lines.append("Step 8 intermediate SOC-row-norm probabilities")
+intermediate_lines.append("")
+intermediate_lines.append("[INTERMEDIATE_CURVES]")
+intermediate_lines.append("label  abs_Ms_low  degeneracy  H_int_cm1  H_rows_cm1")
+
+for label, data in sorted(
+    P_LZ_intermediate.items(),
+    key=lambda x: x[1]["abs_Ms_low"]
+):
+    hrows = ",".join([f"{x:.10f}" for x in data["H_rows_cm1"]])
+
+    intermediate_lines.append(
+        f"{label:20s} "
+        f"{data['abs_Ms_low']:12.6f} "
+        f"{data['degeneracy']:5d} "
+        f"{data['H_int_cm1']:18.10f} "
+        f"{hrows}"
+    )
+
+write_local_text(intermediate_summary_file_step8, "\n".join(intermediate_lines) + "\n")
+
+channel_lines = []
+channel_lines.append("Step 8 Ms-resolved SOC channel probabilities; representative curves only, no summation")
+channel_lines.append("")
+channel_lines.append("[LZ_REPRESENTATIVE_CHANNEL_GROUPS_NO_SUM]")
+channel_lines.append("group_key  H_abs_cm1  equivalent_count  symbols  representative_label  labels")
+
+for key, data in sorted(
+    P_LZ_channel_groups.items(),
+    key=lambda x: x[1]["H_abs_cm1"],
+    reverse=True
+):
+    channel_lines.append(
+        f"{key:16s} "
+        f"{data['H_abs_cm1']:18.10f} "
+        f"{data['degeneracy']:5d} "
+        f"{', '.join(data['channel_symbols']):30s} "
+        f"{data['representative_label']:50s} "
+        + ",".join(
+            format_ms_channel_label_for_text(label)
+            for label in data["labels"]
+        )
+    )
+
+channel_lines.append("")
+channel_lines.append("[WC_REPRESENTATIVE_CHANNEL_GROUPS_NO_SUM]")
+channel_lines.append("group_key  H_abs_cm1  equivalent_count  symbols  representative_label  labels")
+
+for key, data in sorted(
+    P_WC_channel_groups.items(),
+    key=lambda x: x[1]["H_abs_cm1"],
+    reverse=True
+):
+    channel_lines.append(
+        f"{key:16s} "
+        f"{data['H_abs_cm1']:18.10f} "
+        f"{data['degeneracy']:5d} "
+        f"{', '.join(data['channel_symbols']):30s} "
+        f"{data['representative_label']:50s} "
+        + ",".join(
+            format_ms_channel_label_for_text(label)
+            for label in data["labels"]
+        )
+    )
+
+channel_lines.append("")
+channel_lines.append("[INDIVIDUAL_CHANNELS]")
+channel_lines.append(
+    "symbol  label  H_real_cm1  H_imag_cm1  H_abs_cm1  "
+    "S_low  Ms_low  S_high  Ms_high  matrix_i  matrix_j"
+)
+
+for label, data in sorted(
+    P_LZ_channels.items(),
+    key=lambda x: x[1]["H_abs_cm1"],
+    reverse=True
+):
+    H_complex = data["H_complex_cm1"]
+    i, j = data["matrix_index"]
+
+    channel_label_text = format_ms_channel_label_for_text(label)
+
+    channel_lines.append(
+        f"{data['channel_symbol']:20s} "
+        f"{channel_label_text:45s} "
+        f"{H_complex.real:18.10f} "
+        f"{H_complex.imag:18.10f} "
+        f"{data['H_abs_cm1']:18.10f} "
+        f"{data['S_low']:8.3f} "
+        f"{data['Ms_low']:8.3f} "
+        f"{data['S_high']:8.3f} "
+        f"{data['Ms_high']:8.3f} "
+        f"{i:5d} "
+        f"{j:5d}"
+    )
+
+write_local_text(channel_summary_file_step8, "\n".join(channel_lines) + "\n")
+
+# Local PC compatibility aliases.
+# These names point to the same local files and are retained for later
+# shared workflow steps that may still reference remote_* variables.
+remote_summary_file_step8 = summary_file_step8
+remote_effective_grid_file_step8 = effective_grid_file_step8
+remote_channel_summary_file_step8 = channel_summary_file_step8
+remote_intermediate_summary_file_step8 = intermediate_summary_file_step8
+remote_lz_plot_file_step8 = lz_plot_file_step8
+remote_wc_plot_file_step8 = wc_plot_file_step8
+
+print(f"Local Step 8 summary              : {summary_file_step8}")
+print(f"Local effective grid              : {effective_grid_file_step8}")
+print(f"Local intermediate summary        : {intermediate_summary_file_step8}")
+print(f"Local channel summary             : {channel_summary_file_step8}")
+print(f"Local LZ plot                     : {lz_plot_file_step8}")
+print(f"Local WC plot                     : {wc_plot_file_step8}")
+
+print(f"remote_step8 local alias          : {remote_step8}")
+print(f"Step 8 summary alias              : {remote_summary_file_step8}")
+print(f"Effective grid alias              : {remote_effective_grid_file_step8}")
+print(f"Intermediate summary alias        : {remote_intermediate_summary_file_step8}")
+print(f"Channel summary alias             : {remote_channel_summary_file_step8}")
+print(f"LZ plot alias                     : {remote_lz_plot_file_step8}")
+print(f"WC plot alias                     : {remote_wc_plot_file_step8}")
+
+
+# ============================================================
+# Export variables for later steps
+# ============================================================
+
+globals().update({
+    "RUN_MODE": RUN_MODE,
+    "workflow_mode": workflow_mode,
+    "h_SI": h_SI,
+    "c_SI": c_SI,
+    "Eh_to_J": Eh_to_J,
+    "autocm": autocm,
+    "amu_to_kg": amu_to_kg,
+    "amu_to_au": amu_to_au,
+    "bohr_m": bohr_m,
+    "E_MECP": E_MECP,
+    "E_MECP_cm1": E_MECP_cm1,
+    "total_energy_grid_cm1": total_energy_grid_cm1,
+    "probability_energy_grid_cm1": probability_energy_grid_cm1,
+    "energy_step_cm1": energy_step_cm1,
+    "maximum_energy_bin_index": maximum_energy_bin_index,
+    "crossing_energy_bin_index": crossing_energy_bin_index,
+    "gradient_gap_magnitude": gradient_gap_magnitude,
+    "projected_gradient_mean": projected_gradient_mean,
+    "mu_kg": mu_kg,
+    "mu_au": mu_au,
+    "velocity_floor": velocity_floor,
+    "MS_CHANNEL_GROUP_ATOL_CM1": MS_CHANNEL_GROUP_ATOL_CM1,
+    "MS_CHANNEL_GROUP_RTOL": MS_CHANNEL_GROUP_RTOL,
+
+    "P_LZ_effective": P_LZ_effective,
+    "gamma_LZ_effective": gamma_LZ_effective,
+    "P_LZ_micro": P_LZ_micro,
+    "gamma_LZ": gamma_LZ,
+    "P_WC_effective": P_WC_effective,
+    "P_WC_micro": P_WC_micro,
+
+    # Downstream effective-probability aliases.
+    "effective_LZ_probability": effective_LZ_probability,
+    "effective_LZ_gamma": effective_LZ_gamma,
+    "effective_WC_probability": effective_WC_probability,
+    "effective_WC_airy_argument": effective_WC_airy_argument,
+    "effective_WC_airy_value": effective_WC_airy_value,
+    "rate_velocity_bohr_s": rate_velocity_bohr_s,
+
+    "airy_arg_WC_effective": airy_arg_WC_effective,
+    "Ai_WC_effective": Ai_WC_effective,
+
+    "P_LZ_intermediate": P_LZ_intermediate,
+    "P_WC_intermediate": P_WC_intermediate,
+
+    "P_LZ_channels": P_LZ_channels,
+    "P_LZ_channel_groups": P_LZ_channel_groups,
+    "P_WC_channels": P_WC_channels,
+    "P_WC_channel_groups": P_WC_channel_groups,
+
+    "SOC_channel_matrix_cm1": SOC_channel_matrix_cm1,
+    "SOC_channel_matrix_label": SOC_channel_matrix_label,
+
+    "v_bohr_s": v_bohr_s,
+    "v_m_s": v_m_s,
+    "compute_LZ_for_HSO_cm": compute_LZ_for_HSO_cm,
+    "compute_WC_for_HSO_cm": compute_WC_for_HSO_cm,
+    "spin_symbol": spin_symbol,
+    "abs_ms_label": abs_ms_label,
+    "ms_tex_value": ms_tex_value,
+    "channel_tex_label": channel_tex_label,
+    "make_group_channel_legend": make_group_channel_legend,
+
+    "local_step8": local_step8,
+    "remote_step8": remote_step8,
+    "summary_file_step8": summary_file_step8,
+    "effective_grid_file_step8": effective_grid_file_step8,
+    "channel_summary_file_step8": channel_summary_file_step8,
+    "intermediate_summary_file_step8": intermediate_summary_file_step8,
+    "lz_plot_file_step8": lz_plot_file_step8,
+    "wc_plot_file_step8": wc_plot_file_step8,
+    "remote_summary_file_step8": remote_summary_file_step8,
+    "remote_effective_grid_file_step8": remote_effective_grid_file_step8,
+    "remote_channel_summary_file_step8": remote_channel_summary_file_step8,
+    "remote_intermediate_summary_file_step8": remote_intermediate_summary_file_step8,
+    "remote_lz_plot_file_step8": remote_lz_plot_file_step8,
+    "remote_wc_plot_file_step8": remote_wc_plot_file_step8
+})
+
+section("STEP 8 SUMMARY")
+
+print(f"H_SO_cm effective curve           : {float(H_SO_cm):.6f} cm^-1")
+print(f"E_MECP_cm1 threshold              : {E_MECP_cm1:.6f} cm^-1")
+print(f"Common common energy grid                  : {total_energy_grid_cm1[0]:.3f} to {total_energy_grid_cm1[-1]:.3f} cm^-1")
+print(f"Common energy spacing               : {energy_step_cm1:.3f} cm^-1")
+print("Velocity source                   : Step 7; verified against Step 9 definition")
+print(f"P_LZ_effective range              : {np.nanmin(P_LZ_effective):.6e} to {np.nanmax(P_LZ_effective):.6e}")
+print(f"P_WC_effective range              : {np.nanmin(P_WC_effective):.6e} to {np.nanmax(P_WC_effective):.6e}")
+print(f"Number of intermediate curves     : {len(P_LZ_intermediate)}")
+print(f"Number of individual SOC channels : {len(P_LZ_channels)}")
+print(f"Number of representative SOC curves: {len(P_LZ_channel_groups)}")
+
+print("\nSTEP 8 COMPLETED SUCCESSFULLY.\n")
+
+
+#%% STEP 9. Local PC EFFECTIVE, INTERMEDIATE, AND MS-SPECIFIC LZ/WC RATES
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+print(r'''
+====================================================================
+ STEP 9 | LOCAL PC VERSION
+ Effective, intermediate, and MS-specific rates
+====================================================================
+
+This step computes microcanonical rate constants using the
+effective, intermediate, and MS-specific probabilities from Step 8.
+
+No new ORCA calculation is performed here.
+
+The active MECP threshold is forced to the ZPE-corrected barrier from
+Step 7 when VaG_MECP_ZPE_corrected_cm1 is available.
+
+Rate outputs include:
+
+  1. Effective scalar-SOC LZ/WC rates
+  2. Intermediate LZ/WC rates, k^0, k^1, k^1/2, ...
+  3. Symmetry-collapsed MS-specific LZ/WC rates, k^{Ms_LS,Ms_HS}
+
+Every nonzero MS-specific channel is calculated independently.
+Channels with identical |H_SO| values generate identical probabilities
+and rates; only one representative curve is plotted for such channels.
+No MS-specific probabilities, numbers of states, or rates are summed.
+''')
+
+# ============================================================
+# Required variables
+# ============================================================
+
+required_vars_step9 = [
+    "jobname",
+    "freq_reactant_real_cm1",
+    "freq_MECP_real_cm1",
+    "VaG_MECP_cm1",
+    "probability_energy_grid_cm1",
+    "H_SO_cm",
+    "GRADIENT_GAP_NORM_EH_PER_BOHR",
+    "reduced_mass_amu",
+    "reference_rotational_constants_cm1",
+    "crossing_rotational_constants_cm1",
+    "local_base",
+    "remote_base"
+]
+
+for var in required_vars_step9:
+    if var not in globals():
+        raise RuntimeError(
+            f"Required variable '{var}' is missing. Run Local PC Steps 1–8 first."
+        )
+
+RUN_MODE = globals().get("RUN_MODE", "LOCAL")
+workflow_mode = "MECP_ONLY"
+
+SOC_EFFECTIVE_ONLY = bool(globals().get("SOC_EFFECTIVE_ONLY", False))
+SOC_MATRIX_CHANNELS_AVAILABLE = bool(globals().get("SOC_MATRIX_CHANNELS_AVAILABLE", True))
+
+if SOC_EFFECTIVE_ONLY or not SOC_MATRIX_CHANNELS_AVAILABLE:
+    print("\nEffective-only SOC mode active.")
+    print("Only effective LZ/WC rates will be computed/plotted.")
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def section(title):
+    print("\n" + "=" * 72)
+    print(f" {title}")
+    print("=" * 72 + "\n")
+
+
+def write_local_text(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+def save_current_figure(path):
+    plt.tight_layout()
+    plt.savefig(path, dpi=300)
+    plt.show()
+
+
+def ms_tex_value(x):
+    x = float(x)
+
+    if abs(x - round(x)) < 1.0e-8:
+        return str(int(round(x)))
+
+    if abs(abs(x) - 0.5) < 1.0e-8:
+        return r"\frac{1}{2}" if x > 0 else r"-\frac{1}{2}"
+
+    if abs(abs(x) - 1.5) < 1.0e-8:
+        return r"\frac{3}{2}" if x > 0 else r"-\frac{3}{2}"
+
+    if abs(abs(x) - 2.5) < 1.0e-8:
+        return r"\frac{5}{2}" if x > 0 else r"-\frac{5}{2}"
+
+    if abs(abs(x) - 3.5) < 1.0e-8:
+        return r"\frac{7}{2}" if x > 0 else r"-\frac{7}{2}"
+
+    return f"{x:.1f}"
+
+
+def make_rate_group_legend(prefix, group_data):
+    """
+    Build a legend for one representative MS-specific rate curve.
+
+    Multiple symbols mean that the corresponding channels have identical
+    |H_SO| values and therefore identical probability and rate curves.
+    Commas indicate coincident symmetry-equivalent curves; no summation
+    is implied.
+    """
+    symbols = group_data.get("channel_symbols", [])
+    H_abs = float(group_data["H_abs_cm1"])
+
+    if len(symbols) == 0:
+        return rf"{prefix} MS ($|H_{{\mathrm{{SO}}}}|$={H_abs:.1f})"
+
+    rate_symbols = [sym.replace("$P", "$k") for sym in symbols]
+
+    if len(rate_symbols) <= 3:
+        joined = ", ".join(rate_symbols)
+        return rf"{prefix} {joined} ($|H_{{\mathrm{{SO}}}}|$={H_abs:.1f})"
+
+    joined = ", ".join(rate_symbols[:3]) + ", ..."
+    return (
+        rf"{prefix} {joined} ($|H_{{\mathrm{{SO}}}}|$={H_abs:.1f}), "
+        f"equivalent channels={len(rate_symbols)}"
+    )
+
+
+# ============================================================
+# Energy check and active threshold
+# ============================================================
+
+section("STEP 9 ENERGY CHECK")
+
+if "VaG_MECP_electronic_cm1" in globals():
+    print(f"Electronic MECP barrier      : {VaG_MECP_electronic_cm1:.6f} cm^-1")
+
+if "VaG_MECP_ZPE_corrected_cm1" in globals():
+    VaG_MECP_cm1 = float(VaG_MECP_ZPE_corrected_cm1)
+    E_MECP = VaG_MECP_cm1
+    E_MECP_cm1 = VaG_MECP_cm1
+
+    print(f"ZPE-corrected MECP barrier   : {VaG_MECP_ZPE_corrected_cm1:.6f} cm^-1")
+    print(f"Forced Step 9 threshold      : {VaG_MECP_cm1:.6f} cm^-1")
+
+else:
+    E_MECP = float(VaG_MECP_cm1)
+    E_MECP_cm1 = E_MECP
+
+    print(f"Active MECP barrier          : {VaG_MECP_cm1:.6f} cm^-1")
+
+# ============================================================
+# Constants
+# ============================================================
+
+section("CONSTANTS AND GRID SETUP")
+
+autocm = 219474.6313705
+h_SI = 6.62607015e-34
+c_SI = 2.99792458e8
+Eh_to_J = 4.3597447222071e-18
+planck_hsec = h_SI / Eh_to_J
+
+amu_kg = 1.66053906660e-27
+bohr_m = 5.29177210903e-11
+c_cm_s = 2.99792458e10
+kJmol_per_cm1 = 0.01196266
+
+probability_energy_grid_cm1 = np.asarray(
+    probability_energy_grid_cm1,
+    dtype=float
+).reshape(-1)
+
+if probability_energy_grid_cm1.size == 0:
+    raise RuntimeError("The probability energy grid is empty. Run Step 7 first.")
+
+energy_step_cm1 = float(globals().get("energy_step_cm1", 1.0))
+maximum_energy_bin_index = int(
+    np.ceil(np.nanmax(probability_energy_grid_cm1) / energy_step_cm1)
+)
+total_energy_grid_cm1 = (
+    np.arange(maximum_energy_bin_index + 1, dtype=float)
+    * energy_step_cm1
+)
+
+crossing_energy_bin_index = int(
+    np.ceil(E_MECP / energy_step_cm1)
+)
+zero_point_bin_offset = 0
+
+reactant_degeneracy = float(
+    globals().get("reactant_degeneracy", 1.0)
+)
+
+print(f"RUN_MODE                         : {RUN_MODE}")
+print(f"workflow_mode                    : {workflow_mode}")
+print(f"Energy spacing                   : {energy_step_cm1:.3f} cm^-1")
+print(f"Maximum bin energy               : {total_energy_grid_cm1[-1]:.3f} cm^-1")
+print(f"Number of bins                   : {len(total_energy_grid_cm1)}")
+print(f"E_MECP                           : {E_MECP:.6f} cm^-1")
+print(f"Crossing-energy bin              : {crossing_energy_bin_index}")
+print(f"Reactant degeneracy              : {reactant_degeneracy}")
+print(f"Effective H_SO_cm                : {float(H_SO_cm):.6f} cm^-1")
+print(f"reduced_mass_amu                 : {float(reduced_mass_amu):.8f}")
+
+# ============================================================
+# Clean frequencies and rotations
+# ============================================================
+
+section("FREQUENCY AND ROTATIONAL DATA")
+
+freq_R = np.asarray(freq_reactant_real_cm1, dtype=float).reshape(-1)
+freq_X = np.asarray(freq_MECP_real_cm1, dtype=float).reshape(-1)
+
+freq_R = freq_R[np.isfinite(freq_R) & (freq_R > 0.0)]
+freq_X = freq_X[np.isfinite(freq_X) & (freq_X > 0.0)]
+
+rot_R_cm1 = np.asarray(
+    reference_rotational_constants_cm1,
+    dtype=float
+).reshape(-1)
+rot_X_cm1 = np.asarray(
+    crossing_rotational_constants_cm1,
+    dtype=float
+).reshape(-1)
+
+rot_R_cm1 = rot_R_cm1[np.isfinite(rot_R_cm1) & (rot_R_cm1 > 0.0)]
+rot_X_cm1 = rot_X_cm1[np.isfinite(rot_X_cm1) & (rot_X_cm1 > 0.0)]
+
+if len(rot_R_cm1) != 3:
+    raise RuntimeError("reference_rotational_constants_cm1 must contain 3 positive values.")
+
+if len(rot_X_cm1) != 3:
+    raise RuntimeError("crossing_rotational_constants_cm1 must contain 3 positive values.")
+
+if len(freq_R) == 0:
+    raise RuntimeError("No positive reactant frequencies were found.")
+
+if len(freq_X) == 0:
+    raise RuntimeError("No positive MECP effective-Hessian frequencies were found.")
+
+
+def rot_constants_to_inertia_amu_bohr2(B_cm1):
+    conv = h_SI / (8.0 * np.pi**2 * c_cm_s) / (amu_kg * bohr_m**2)
+    return conv / np.asarray(B_cm1, dtype=float)
+
+
+reference_principal_inertias = rot_constants_to_inertia_amu_bohr2(rot_R_cm1)
+crossing_principal_inertias = rot_constants_to_inertia_amu_bohr2(rot_X_cm1)
+
+print(f"Reactant frequencies used         : {len(freq_R)}")
+print(f"MECP frequencies used             : {len(freq_X)}")
+print(f"Reference rot constants cm^-1     : {rot_R_cm1}")
+print(f"MECP rot constants cm^-1          : {rot_X_cm1}")
+print(f"Reference inertias amu Bohr^2     : {reference_principal_inertias}")
+print(f"MECP inertias amu Bohr^2          : {crossing_principal_inertias}")
+
+# ============================================================
+# Independently implemented rovibrational state-density engine
+# ============================================================
+
+section("ROVIBRATIONAL DENSITY OF STATES")
+
+
+def build_harmonic_ladder_density(
+    frequencies_cm1,
+    maximum_bin_index,
+    energy_spacing_cm1
+):
+    """
+    Construct the discrete vibrational ladder density on a zero-based grid.
+
+    Each positive normal-mode frequency contributes one count at every
+    positive harmonic excitation bin. The implementation uses vectorized
+    index generation and bincount rather than nested state-index loops.
+    """
+    frequencies = np.asarray(frequencies_cm1, dtype=float).reshape(-1)
+    frequencies = frequencies[
+        np.isfinite(frequencies) & (frequencies > 0.0)
+    ]
+
+    density = np.zeros(maximum_bin_index + 1, dtype=float)
+
+    for frequency in frequencies:
+        largest_quantum = int(
+            np.floor(
+                maximum_bin_index
+                * energy_spacing_cm1
+                / frequency
+            )
+        )
+
+        if largest_quantum <= 0:
+            continue
+
+        quantum_numbers = np.arange(
+            1,
+            largest_quantum + 1,
+            dtype=float
+        )
+
+        occupied_bins = np.ceil(
+            frequency * quantum_numbers / energy_spacing_cm1
+        ).astype(int)
+
+        occupied_bins = occupied_bins[
+            (occupied_bins > 0)
+            & (occupied_bins <= maximum_bin_index)
+        ]
+
+        if occupied_bins.size:
+            density += np.bincount(
+                occupied_bins,
+                minlength=maximum_bin_index + 1
+            )[:maximum_bin_index + 1]
+
+    # Preserve the zero-excitation reference contribution on the first
+    # positive-energy bin used by the discrete state-density convention.
+    if maximum_bin_index >= 1:
+        density[1] += 1.0
+
+    return density / energy_spacing_cm1
+
+
+def build_classical_rotational_density(
+    principal_inertias_amu_bohr2,
+    energy_grid_cm1,
+    hartree_per_wavenumber
+):
+    """
+    Evaluate the rotational density directly on the physical energy grid.
+    """
+    inertias = np.asarray(
+        principal_inertias_amu_bohr2,
+        dtype=float
+    ).reshape(-1)
+
+    inertia_product = float(np.prod(inertias))
+    energies = np.asarray(energy_grid_cm1, dtype=float)
+
+    density = np.zeros_like(energies)
+    positive = energies > 0.0
+
+    density[positive] = (
+        4.0
+        * np.sqrt(
+            2.0
+            * energies[positive]
+            / hartree_per_wavenumber
+            * inertia_product
+        )
+        / hartree_per_wavenumber
+    )
+
+    return density
+
+
+def convolve_internal_densities(
+    rotational_density,
+    vibrational_density,
+    energy_spacing_cm1
+):
+    """
+    Combine rotational and vibrational densities by a zero-based discrete
+    convolution. Array element zero is reserved for the threshold origin;
+    positive-energy data begin at element one.
+    """
+    rotational_positive = np.asarray(
+        rotational_density,
+        dtype=float
+    )[1:]
+
+    vibrational_positive = np.asarray(
+        vibrational_density,
+        dtype=float
+    )[1:]
+
+    convolution = np.convolve(
+        rotational_positive,
+        vibrational_positive,
+        mode="full"
+    )
+
+    result = np.zeros_like(rotational_density, dtype=float)
+    usable = min(result.size - 1, convolution.size)
+
+    if usable > 0:
+        result[1:usable + 1] = (
+            convolution[:usable] * energy_spacing_cm1
+        )
+
+    return result
+
+
+vibrational_density_reference = build_harmonic_ladder_density(
+    freq_R,
+    maximum_energy_bin_index,
+    energy_step_cm1
+)
+
+vibrational_density_crossing = build_harmonic_ladder_density(
+    freq_X,
+    maximum_energy_bin_index,
+    energy_step_cm1
+)
+
+rotational_density_reference = build_classical_rotational_density(
+    reference_principal_inertias,
+    total_energy_grid_cm1,
+    autocm
+)
+
+rotational_density_crossing = build_classical_rotational_density(
+    crossing_principal_inertias,
+    total_energy_grid_cm1,
+    autocm
+)
+
+reactant_state_density = convolve_internal_densities(
+    rotational_density_reference,
+    vibrational_density_reference,
+    energy_step_cm1
+)
+
+crossing_internal_state_density = convolve_internal_densities(
+    rotational_density_crossing,
+    vibrational_density_crossing,
+    energy_step_cm1
+)
+
+crossing_shifted_state_density = np.zeros_like(
+    crossing_internal_state_density
+)
+
+available_shifted_bins = (
+    maximum_energy_bin_index - crossing_energy_bin_index
+)
+
+if available_shifted_bins > 0:
+    crossing_shifted_state_density[
+        crossing_energy_bin_index + 1:
+        crossing_energy_bin_index + 1 + available_shifted_bins
+    ] = crossing_internal_state_density[
+        1:
+        1 + available_shifted_bins
+    ]
+
+print(
+    f"Reactant DOS max                 : "
+    f"{np.nanmax(reactant_state_density):.6e}"
+)
+print(
+    f"Crossing internal DOS max        : "
+    f"{np.nanmax(crossing_internal_state_density):.6e}"
+)
+print(
+    f"Crossing shifted LZ DOS max      : "
+    f"{np.nanmax(crossing_shifted_state_density):.6e}"
+)
+
+# ============================================================
+# Probability helper for arbitrary HSO
+# ============================================================
+
+def compute_landau_zener_probability_for_coupling(H_cm, E_grid_cm1):
+    E_grid_cm1 = np.asarray(E_grid_cm1, dtype=float).reshape(-1)
+
+    H_cm = float(abs(H_cm))
+    gradient_gap_local = abs(float(GRADIENT_GAP_NORM_EH_PER_BOHR))
+    mu_kg_local = float(reduced_mass_amu) * amu_kg
+
+    H_J = h_SI * c_SI * H_cm * 100.0
+    E_excess_J = (
+        (E_grid_cm1 - E_MECP)
+        * 100.0
+        * h_SI
+        * c_SI
+    )
+
+    v_m_s_local = np.zeros_like(E_grid_cm1)
+    mask_energy = E_excess_J > 0.0
+
+    v_m_s_local[mask_energy] = np.sqrt(
+        2.0 * E_excess_J[mask_energy] / mu_kg_local
+    )
+
+    v_bohr_s_local = v_m_s_local / bohr_m
+
+    gamma = np.full_like(E_grid_cm1, np.nan, dtype=float)
+    P = np.zeros_like(E_grid_cm1, dtype=float)
+
+    mask = (
+        np.isfinite(E_grid_cm1)
+        & np.isfinite(v_bohr_s_local)
+        & (E_grid_cm1 >= E_MECP)
+        & (v_bohr_s_local > 1.0e-12)
+    )
+
+    energy_gap_sweep_rate_Eh_s = gradient_gap_local * v_bohr_s_local
+    energy_gap_sweep_rate_J_s = energy_gap_sweep_rate_Eh_s * Eh_to_J
+
+    gamma[mask] = (
+        4.0 * np.pi**2 * H_J**2
+        / (h_SI * energy_gap_sweep_rate_J_s[mask])
+    )
+
+    P[mask] = 1.0 - np.exp(-2.0 * gamma[mask])
+    P = np.clip(P, 0.0, 1.0)
+
+    return P, gamma, v_bohr_s_local
+
+# ============================================================
+# Independently implemented probability-weighted rate engine
+# ============================================================
+
+section("RATE HELPER FUNCTIONS")
+
+
+def microcanonical_rate_from_cumulative_states(
+    cumulative_states,
+    reactant_density,
+    reactant_degeneracy_factor
+):
+    """
+    Convert a cumulative crossing-state count into a microcanonical rate.
+    """
+    cumulative_states = np.asarray(
+        cumulative_states,
+        dtype=float
+    )
+
+    reactant_density = np.asarray(
+        reactant_density,
+        dtype=float
+    )
+
+    rate = np.zeros_like(cumulative_states)
+    valid = (
+        np.isfinite(cumulative_states)
+        & np.isfinite(reactant_density)
+        & (reactant_density > 0.0)
+    )
+
+    rate[valid] = (
+        reactant_degeneracy_factor
+        * cumulative_states[valid]
+        / (reactant_density[valid] * planck_hsec)
+    )
+
+    rate[~np.isfinite(rate)] = 0.0
+    return np.clip(rate, 0.0, None)
+
+
+def convolve_probability_with_crossing_density(
+    probability,
+    crossing_density,
+    probability_start_index,
+    output_start_index
+):
+    """
+    Convolve probability values with an unshifted crossing-state density.
+
+    Both inputs are handled as zero-based arrays. The explicit start indices
+    define the physical threshold locations and avoid translated 1-based
+    indexing expressions.
+    """
+    probability = np.asarray(probability, dtype=float).reshape(-1)
+    crossing_density = np.asarray(
+        crossing_density,
+        dtype=float
+    ).reshape(-1)
+
+    expected_size = maximum_energy_bin_index + 1
+
+    if probability.size != expected_size:
+        raise RuntimeError(
+            f"Probability array has length {probability.size}; "
+            f"expected {expected_size}."
+        )
+
+    probability_segment = probability[probability_start_index:]
+    density_segment = crossing_density[1:]
+
+    convolution = np.convolve(
+        probability_segment,
+        density_segment,
+        mode="full"
+    )
+
+    cumulative_states = np.zeros(expected_size, dtype=float)
+    available = min(
+        expected_size - output_start_index,
+        convolution.size
+    )
+
+    if available > 0:
+        cumulative_states[
+            output_start_index:
+            output_start_index + available
+        ] = (
+            convolution[:available]
+            * energy_step_cm1
+            / autocm
+        )
+
+    return cumulative_states
+
+
+def compute_landau_zener_microcanonical_rate(probability):
+    cumulative_states = convolve_probability_with_crossing_density(
+        probability=probability,
+        crossing_density=crossing_internal_state_density,
+        probability_start_index=crossing_energy_bin_index + 1,
+        output_start_index=crossing_energy_bin_index + 1
+    )
+
+    rate = microcanonical_rate_from_cumulative_states(
+        cumulative_states,
+        reactant_state_density,
+        reactant_degeneracy
+    )
+
+    return cumulative_states, rate
+
+
+def compute_weak_coupling_microcanonical_rate(probability):
+    cumulative_states = convolve_probability_with_crossing_density(
+        probability=probability,
+        crossing_density=crossing_internal_state_density,
+        probability_start_index=1,
+        output_start_index=1
+    )
+
+    rate = microcanonical_rate_from_cumulative_states(
+        cumulative_states,
+        reactant_state_density,
+        reactant_degeneracy
+    )
+
+    return cumulative_states, rate
+
+
+print("Independent convolution-based rate functions prepared.")
+
+# ============================================================
+# Effective LZ/WC rates
+# ============================================================
+
+section("EFFECTIVE LZ/WC RATE CALCULATION")
+
+effective_LZ_probability, effective_LZ_exponent, effective_velocity_bohr_per_s = (
+    compute_landau_zener_probability_for_coupling(H_SO_cm, total_energy_grid_cm1)
+)
+
+effective_LZ_cumulative_states, effective_LZ_rate = compute_landau_zener_microcanonical_rate(effective_LZ_probability)
+
+probLZ = effective_LZ_probability
+gamma_LZ_rate = effective_LZ_exponent
+LZ_cumulative_states = effective_LZ_cumulative_states
+LZ_rate = effective_LZ_rate
+
+if "compute_weak_coupling_probability" in globals():
+    effective_WC_probability, effective_WC_airy_argument, effective_WC_airy_value = compute_weak_coupling_probability(
+        H_SO_cm,
+        total_energy_grid_cm1
+    )
+
+elif "P_WC_effective" in globals():
+    effective_WC_probability = np.asarray(P_WC_effective, dtype=float).reshape(-1)
+
+    if effective_WC_probability.size != total_energy_grid_cm1.size:
+        raise RuntimeError(
+            "P_WC_effective grid size differs from total_energy_grid_cm1 and "
+            "compute_WC_for_HSO_cm is unavailable."
+        )
+
+    effective_WC_airy_argument = np.full_like(total_energy_grid_cm1, np.nan, dtype=float)
+    effective_WC_airy_value = np.full_like(total_energy_grid_cm1, np.nan, dtype=float)
+
+else:
+    raise RuntimeError("WC probability is missing. Run Step 8 first.")
+
+effective_WC_cumulative_states, effective_WC_rate = compute_weak_coupling_microcanonical_rate(effective_WC_probability)
+
+probWC = effective_WC_probability
+WC_cumulative_states = effective_WC_cumulative_states
+WC_rate = effective_WC_rate
+
+print(f"P_LZ effective range              : {np.nanmin(effective_LZ_probability):.6e} to {np.nanmax(effective_LZ_probability):.6e}")
+print(f"k_LZ effective range              : {np.nanmin(effective_LZ_rate):.6e} to {np.nanmax(effective_LZ_rate):.6e}")
+print(f"P_WC effective range              : {np.nanmin(effective_WC_probability):.6e} to {np.nanmax(effective_WC_probability):.6e}")
+print(f"k_WC effective range              : {np.nanmin(effective_WC_rate):.6e} to {np.nanmax(effective_WC_rate):.6e}")
+
+# ============================================================
+# Intermediate rates from Step 8
+# ============================================================
+
+section("INTERMEDIATE RATE CALCULATION")
+
+k_LZ_intermediate = {}
+N_LZ_intermediate = {}
+P_LZ_intermediate_rate_grid = {}
+
+if "P_LZ_intermediate" in globals() and len(P_LZ_intermediate) > 0:
+    for int_label, int_data in P_LZ_intermediate.items():
+        H_int = float(int_data["H_int_cm1"])
+
+        P_int, gamma_int, _ = compute_landau_zener_probability_for_coupling(
+            H_int,
+            total_energy_grid_cm1
+        )
+
+        N_int, k_int = compute_landau_zener_microcanonical_rate(P_int)
+
+        P_LZ_intermediate_rate_grid[int_label] = P_int
+        N_LZ_intermediate[int_label] = N_int
+        k_LZ_intermediate[int_label] = {
+            "H_int_cm1": H_int,
+            "abs_Ms_low": float(int_data["abs_Ms_low"]),
+            "degeneracy": int(int_data["degeneracy"]),
+            "k": k_int,
+            "N": N_int,
+            "P": P_int
+        }
+
+    print(f"Computed LZ intermediate rates for {len(k_LZ_intermediate)} curves.")
+else:
+    print("No P_LZ_intermediate found from Step 8.")
+
+k_WC_intermediate = {}
+N_WC_intermediate = {}
+P_WC_intermediate_rate_grid = {}
+
+if "P_WC_intermediate" in globals() and len(P_WC_intermediate) > 0:
+    for int_label, int_data in P_WC_intermediate.items():
+        H_int = float(int_data["H_int_cm1"])
+
+        if "compute_weak_coupling_probability" in globals():
+            P_int, _, _ = compute_weak_coupling_probability(H_int, total_energy_grid_cm1)
+        else:
+            P_int = np.asarray(int_data["P"], dtype=float).reshape(-1)
+
+            if P_int.size != total_energy_grid_cm1.size:
+                raise RuntimeError(
+                    f"WC intermediate {int_label} grid size differs from total_energy_grid_cm1."
+                )
+
+        N_int, k_int = compute_weak_coupling_microcanonical_rate(P_int)
+
+        P_WC_intermediate_rate_grid[int_label] = P_int
+        N_WC_intermediate[int_label] = N_int
+        k_WC_intermediate[int_label] = {
+            "H_int_cm1": H_int,
+            "abs_Ms_low": float(int_data["abs_Ms_low"]),
+            "degeneracy": int(int_data["degeneracy"]),
+            "k": k_int,
+            "N": N_int,
+            "P": P_int
+        }
+
+    print(f"Computed WC intermediate rates for {len(k_WC_intermediate)} curves.")
+else:
+    print("No P_WC_intermediate found from Step 8.")
+
+# ============================================================
+# MS-specific channel rates
+# ============================================================
+
+section("MS-SPECIFIC CHANNEL RATE CALCULATION")
+
+k_LZ_channels = {}
+N_LZ_channels = {}
+P_LZ_channels_rate_grid = {}
+
+if "P_LZ_channels" in globals() and len(P_LZ_channels) > 0:
+    for ch_label, ch_data in P_LZ_channels.items():
+        H_abs = float(ch_data["H_abs_cm1"])
+
+        P_ch, gamma_ch, _ = compute_landau_zener_probability_for_coupling(
+            H_abs,
+            total_energy_grid_cm1
+        )
+
+        N_ch, k_ch = compute_landau_zener_microcanonical_rate(P_ch)
+
+        P_LZ_channels_rate_grid[ch_label] = P_ch
+        N_LZ_channels[ch_label] = N_ch
+        k_LZ_channels[ch_label] = k_ch
+
+    print(f"Computed LZ rates for {len(k_LZ_channels)} individual MS-specific channels.")
+else:
+    print("No P_LZ_channels found from Step 8.")
+
+k_WC_channels = {}
+N_WC_channels = {}
+P_WC_channels_rate_grid = {}
+
+if "P_WC_channels" in globals() and len(P_WC_channels) > 0:
+    for ch_label, ch_data in P_WC_channels.items():
+        H_abs = float(ch_data["H_abs_cm1"])
+
+        if "compute_weak_coupling_probability" in globals():
+            P_ch, _, _ = compute_weak_coupling_probability(H_abs, total_energy_grid_cm1)
+        else:
+            P_ch = np.asarray(ch_data["P"], dtype=float).reshape(-1)
+
+            if P_ch.size != total_energy_grid_cm1.size:
+                raise RuntimeError(
+                    f"WC channel {ch_label} probability grid size differs from total_energy_grid_cm1."
+                )
+
+        N_ch, k_ch = compute_weak_coupling_microcanonical_rate(P_ch)
+
+        P_WC_channels_rate_grid[ch_label] = P_ch
+        N_WC_channels[ch_label] = N_ch
+        k_WC_channels[ch_label] = k_ch
+
+    print(f"Computed WC rates for {len(k_WC_channels)} individual MS-specific channels.")
+else:
+    print("No P_WC_channels found from Step 8.")
+
+# ============================================================
+# Symmetry-collapsed MS-specific channel rates
+# ============================================================
+
+section("SYMMETRY-COLLAPSED MS-SPECIFIC RATE CURVES")
+
+# Step 8 groups channels only when their |H_SO| values are numerically
+# identical. Such channels have identical probabilities and therefore
+# identical N(E) and k(E). We retain one representative curve for each
+# group and keep all channel labels for the legend. Nothing is summed.
+
+k_LZ_channel_groups = {}
+N_LZ_channel_groups = {}
+P_LZ_channel_groups_rate_grid = {}
+
+if "P_LZ_channel_groups" in globals() and len(P_LZ_channel_groups) > 0:
+    for group_key, group_data in P_LZ_channel_groups.items():
+        labels = list(group_data.get("labels", []))
+
+        representative_label = group_data.get("representative_label")
+        if representative_label not in k_LZ_channels:
+            representative_label = next(
+                (label for label in labels if label in k_LZ_channels),
+                None
+            )
+
+        if representative_label is None:
+            continue
+
+        k_rep = np.asarray(
+            k_LZ_channels[representative_label],
+            dtype=float
+        ).copy()
+
+        N_rep = np.asarray(
+            N_LZ_channels[representative_label],
+            dtype=float
+        ).copy()
+
+        P_rep = np.asarray(
+            P_LZ_channels_rate_grid[representative_label],
+            dtype=float
+        ).copy()
+
+        k_LZ_channel_groups[group_key] = {
+            "H_abs_cm1": float(group_data["H_abs_cm1"]),
+            "labels": labels,
+            "channel_symbols": list(
+                group_data.get("channel_symbols", [])
+            ),
+            "degeneracy": len(labels),
+            "representative_label": representative_label,
+            "k_representative": k_rep,
+            "N_representative": N_rep,
+            "P_representative": P_rep,
+            "combination_rule": "representative_only_no_sum"
+        }
+
+        N_LZ_channel_groups[group_key] = N_rep
+        P_LZ_channel_groups_rate_grid[group_key] = P_rep
+
+
+k_WC_channel_groups = {}
+N_WC_channel_groups = {}
+P_WC_channel_groups_rate_grid = {}
+
+if "P_WC_channel_groups" in globals() and len(P_WC_channel_groups) > 0:
+    for group_key, group_data in P_WC_channel_groups.items():
+        labels = list(group_data.get("labels", []))
+
+        representative_label = group_data.get("representative_label")
+        if representative_label not in k_WC_channels:
+            representative_label = next(
+                (label for label in labels if label in k_WC_channels),
+                None
+            )
+
+        if representative_label is None:
+            continue
+
+        k_rep = np.asarray(
+            k_WC_channels[representative_label],
+            dtype=float
+        ).copy()
+
+        N_rep = np.asarray(
+            N_WC_channels[representative_label],
+            dtype=float
+        ).copy()
+
+        P_rep = np.asarray(
+            P_WC_channels_rate_grid[representative_label],
+            dtype=float
+        ).copy()
+
+        k_WC_channel_groups[group_key] = {
+            "H_abs_cm1": float(group_data["H_abs_cm1"]),
+            "labels": labels,
+            "channel_symbols": list(
+                group_data.get("channel_symbols", [])
+            ),
+            "degeneracy": len(labels),
+            "representative_label": representative_label,
+            "k_representative": k_rep,
+            "N_representative": N_rep,
+            "P_representative": P_rep,
+            "combination_rule": "representative_only_no_sum"
+        }
+
+        N_WC_channel_groups[group_key] = N_rep
+        P_WC_channel_groups_rate_grid[group_key] = P_rep
+
+print(f"Representative LZ MS curves       : {len(k_LZ_channel_groups)}")
+print(f"Representative WC MS curves       : {len(k_WC_channel_groups)}")
+print("MS-specific combination rule      : representative only; no summation")
+
+# ============================================================
+# Final arrays and backward-compatible names
+# ============================================================
+
+section("FINAL RATE ARRAYS")
+
+E_rate_LZ_cm1 = total_energy_grid_cm1[1:]
+E_rate_WC_cm1 = total_energy_grid_cm1[1:]
+
+rho_reactant_cm = reactant_state_density[1:]
+rho_MECP_internal_cm = crossing_internal_state_density[1:]
+rho_MECP_shifted_plot = crossing_shifted_state_density[1:]
+
+P_LZ_rate_grid = effective_LZ_probability[1:]
+gamma_LZ_rate_grid = effective_LZ_exponent[1:]
+effective_velocity_bohr_per_s_grid = effective_velocity_bohr_per_s[1:]
+
+N_MECP_LZ = effective_LZ_cumulative_states[1:]
+k_LZ_micro_s_inv = effective_LZ_rate[1:]
+
+k_LZ_effective_micro_s_inv = k_LZ_micro_s_inv
+N_MECP_LZ_effective = N_MECP_LZ
+
+positive_k = k_LZ_micro_s_inv > 0.0
+log_k_LZ_raw = np.full_like(k_LZ_micro_s_inv, np.nan)
+log_k_LZ_raw[positive_k] = np.log10(k_LZ_micro_s_inv[positive_k])
+E_LZ_log_raw_cm1 = E_rate_LZ_cm1
+
+P_WC_rate_grid = effective_WC_probability[1:]
+N_MECP_WC = effective_WC_cumulative_states[1:]
+k_WC_micro_s_inv = effective_WC_rate[1:]
+
+k_WC_effective_micro_s_inv = k_WC_micro_s_inv
+N_MECP_WC_effective = N_MECP_WC
+
+positive_k_wc = k_WC_micro_s_inv > 0.0
+log_k_WC_raw = np.full_like(k_WC_micro_s_inv, np.nan)
+log_k_WC_raw[positive_k_wc] = np.log10(k_WC_micro_s_inv[positive_k_wc])
+E_WC_log_raw_cm1 = E_rate_WC_cm1
+
+reactant_state_density_independent = reactant_state_density
+crossing_shifted_state_density_independent = crossing_shifted_state_density
+crossing_internal_state_density_independent = crossing_internal_state_density
+
+LZ_cumulative_states_independent = effective_LZ_cumulative_states
+LZ_rate_independent = effective_LZ_rate
+
+WC_cumulative_states_independent = effective_WC_cumulative_states
+WC_rate_independent = effective_WC_rate
+
+print(f"E_rate_LZ_cm1 range               : {E_rate_LZ_cm1[0]:.3f} to {E_rate_LZ_cm1[-1]:.3f}")
+print(f"E_rate_WC_cm1 range               : {E_rate_WC_cm1[0]:.3f} to {E_rate_WC_cm1[-1]:.3f}")
+print(f"k_LZ effective final max           : {np.nanmax(k_LZ_micro_s_inv):.6e} s^-1")
+print(f"k_WC effective final max           : {np.nanmax(k_WC_micro_s_inv):.6e} s^-1")
+
+# ============================================================
+# Save plots
+# ============================================================
+
+section("PLOTTING STEP 9 RATE RESULTS")
+
+local_step9 = os.path.join(local_base, "Microcanonical_rates")
+os.makedirs(local_step9, exist_ok=True)
+
+# Local PC compatibility alias. No remote directory is created.
+remote_step9 = local_step9
+
+plot_files_step9 = {}
+
+def register_plot(name):
+    path = os.path.join(local_step9, f"Step9_{name}.png")
+    plot_files_step9[name] = path
+    return path
+
+# LZ probability used in rate
+plt.figure(figsize=(8, 4.5))
+plt.plot(
+    E_rate_LZ_cm1,
+    P_LZ_rate_grid,
+    linewidth=2,
+    label=rf"LZ $P^{{eff}}$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+)
+plt.axvline(E_MECP, color="k", linestyle="--", linewidth=1.5, label="ZPE-corrected MECP")
+plt.xlabel("Total energy relative to reference minimum (cm$^{-1}$)", fontsize=12)
+plt.ylabel("Landau-Zener probability", fontsize=12)
+plt.title("Effective LZ Probability Used in Rate", fontsize=14)
+plt.tick_params(axis="both", labelsize=12)
+plt.grid(False)
+plt.legend()
+save_current_figure(register_plot("LZ_probability_used_in_rate"))
+
+# DOS
+plt.figure(figsize=(8, 4.5))
+plt.plot(E_rate_LZ_cm1, rho_reactant_cm, linewidth=2, label="Reactant rovib DOS")
+plt.plot(E_rate_LZ_cm1, rho_MECP_shifted_plot, linewidth=2, label="MECP rovib DOS shifted for LZ")
+plt.plot(E_rate_LZ_cm1, rho_MECP_internal_cm, linewidth=2, linestyle=":", label="MECP internal rovib DOS for WC")
+plt.axvline(E_MECP, color="k", linestyle="--", linewidth=1.5, label="ZPE-corrected MECP")
+plt.xlabel("Total energy relative to reference minimum (cm$^{-1}$)", fontsize=12)
+plt.ylabel("Density of states", fontsize=12)
+plt.title("Rovibrational Density of States", fontsize=14)
+plt.tick_params(axis="both", labelsize=12)
+plt.grid(False)
+plt.legend()
+save_current_figure(register_plot("rovibrational_DOS"))
+
+# Number of states
+plt.figure(figsize=(8, 4.5))
+plt.plot(E_rate_LZ_cm1, N_MECP_LZ, linewidth=2, label="LZ N(E)")
+plt.plot(E_rate_WC_cm1, N_MECP_WC, linewidth=2, linestyle=":", label="WC N(E)")
+plt.axvline(E_MECP, color="k", linestyle="--", linewidth=1.5, label="ZPE-corrected MECP")
+plt.xlabel("Total energy relative to reference minimum (cm$^{-1}$)", fontsize=12)
+plt.ylabel("N(E)", fontsize=12)
+plt.title("Effective Number of States: LZ vs WC", fontsize=14)
+plt.tick_params(axis="both", labelsize=12)
+plt.grid(False)
+plt.legend()
+save_current_figure(register_plot("number_of_states_LZ_vs_WC"))
+
+# LZ rates linear
+plt.figure(figsize=(9.2, 5.2))
+plt.plot(
+    E_rate_LZ_cm1,
+    k_LZ_effective_micro_s_inv,
+    linewidth=2.2,
+    color="k",
+    linestyle=":",
+    label=rf"LZ $k^{{eff}}$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+)
+
+for key, data in sorted(
+    k_LZ_intermediate.items(),
+    key=lambda x: x[1]["abs_Ms_low"]
+):
+    plt.plot(
+        E_rate_LZ_cm1,
+        data["k"][1:],
+        linewidth=2.0,
+        linestyle="--",
+        label=(
+            f"LZ $k^{{{ms_tex_value(data['abs_Ms_low'])}}}$ "
+            rf"($H_{{\mathrm{{SO}}}}^{{int}}$={data['H_int_cm1']:.1f})"
+        )
+    )
+
+for key, data in sorted(
+    k_LZ_channel_groups.items(),
+    key=lambda x: x[1]["H_abs_cm1"],
+    reverse=True
+):
+    plt.plot(
+        E_rate_LZ_cm1,
+        data["k_representative"][1:],
+        linewidth=1.5,
+        label=make_rate_group_legend("LZ", data)
+    )
+
+plt.axvline(E_MECP, color="k", linestyle="--", linewidth=1.5, label="ZPE-corrected MECP")
+plt.xlabel("Total energy relative to reference minimum (cm$^{-1}$)", fontsize=12)
+plt.ylabel(r"$k_{\mathrm{LZ}}(E)$ (s$^{-1}$)", fontsize=12)
+plt.title("Effective, Intermediate, and MS-specific LZ Microcanonical Rates", fontsize=14)
+plt.tick_params(axis="both", labelsize=12)
+plt.grid(False)
+plt.legend()
+save_current_figure(register_plot("LZ_effective_intermediate_MS_rates"))
+
+# LZ log rates
+plt.figure(figsize=(9.2, 5.2))
+mask_eff_lz = k_LZ_effective_micro_s_inv > 0.0
+plt.plot(
+    E_rate_LZ_cm1[mask_eff_lz],
+    np.log10(k_LZ_effective_micro_s_inv[mask_eff_lz]),
+    linewidth=2.2,
+    color="k",
+    linestyle=":",
+    label=rf"LZ $k^{{eff}}$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+)
+
+for key, data in sorted(
+    k_LZ_intermediate.items(),
+    key=lambda x: x[1]["abs_Ms_low"]
+):
+    k_int = data["k"][1:]
+    mask = k_int > 0.0
+
+    plt.plot(
+        E_rate_LZ_cm1[mask],
+        np.log10(k_int[mask]),
+        linewidth=2.0,
+        linestyle="--",
+        label=(
+            f"LZ $k^{{{ms_tex_value(data['abs_Ms_low'])}}}$ "
+            rf"($H_{{\mathrm{{SO}}}}^{{int}}$={data['H_int_cm1']:.1f})"
+        )
+    )
+
+for key, data in sorted(
+    k_LZ_channel_groups.items(),
+    key=lambda x: x[1]["H_abs_cm1"],
+    reverse=True
+):
+    k_group = data["k_representative"][1:]
+    mask = k_group > 0.0
+
+    plt.plot(
+        E_rate_LZ_cm1[mask],
+        np.log10(k_group[mask]),
+        linewidth=1.5,
+        label=make_rate_group_legend("LZ", data)
+    )
+
+plt.axvline(E_MECP, color="k", linestyle="--", linewidth=1.5, label="ZPE-corrected MECP")
+plt.xlabel("Total energy relative to reference minimum (cm$^{-1}$)", fontsize=12)
+plt.ylabel(r"$\log_{10}[k_{\mathrm{LZ}}(E)/\mathrm{s}^{-1}]$", fontsize=12)
+plt.title("Log-scale Effective, Intermediate, and MS-specific LZ Microcanonical Rates", fontsize=14)
+plt.tick_params(axis="both", labelsize=12)
+plt.grid(False)
+plt.legend()
+save_current_figure(register_plot("LZ_effective_intermediate_MS_log_rates"))
+
+# WC probability used in rate
+plt.figure(figsize=(8, 4.5))
+plt.plot(
+    E_rate_WC_cm1,
+    P_WC_rate_grid,
+    linewidth=2,
+    label=rf"WC $P^{{eff}}$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+)
+plt.axvline(E_MECP, color="k", linestyle="--", linewidth=1.5, label="ZPE-corrected MECP")
+plt.xlabel("Total energy relative to reference minimum (cm$^{-1}$)", fontsize=12)
+plt.ylabel("Weak-coupling probability", fontsize=12)
+plt.title("Effective WC Probability Used in Rate", fontsize=14)
+plt.tick_params(axis="both", labelsize=12)
+plt.grid(False)
+plt.legend()
+save_current_figure(register_plot("WC_probability_used_in_rate"))
+
+# WC rates linear
+plt.figure(figsize=(9.2, 5.2))
+plt.plot(
+    E_rate_WC_cm1,
+    k_WC_effective_micro_s_inv,
+    linewidth=2.2,
+    color="k",
+    linestyle=":",
+    label=rf"WC $k^{{eff}}$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+)
+
+for key, data in sorted(
+    k_WC_intermediate.items(),
+    key=lambda x: x[1]["abs_Ms_low"]
+):
+    plt.plot(
+        E_rate_WC_cm1,
+        data["k"][1:],
+        linewidth=2.0,
+        linestyle="--",
+        label=(
+            f"WC $k^{{{ms_tex_value(data['abs_Ms_low'])}}}$ "
+            rf"($H_{{\mathrm{{SO}}}}^{{int}}$={data['H_int_cm1']:.1f})"
+        )
+    )
+
+for key, data in sorted(
+    k_WC_channel_groups.items(),
+    key=lambda x: x[1]["H_abs_cm1"],
+    reverse=True
+):
+    plt.plot(
+        E_rate_WC_cm1,
+        data["k_representative"][1:],
+        linewidth=1.5,
+        label=make_rate_group_legend("WC", data)
+    )
+
+plt.axvline(E_MECP, color="k", linestyle="--", linewidth=1.5, label="ZPE-corrected MECP")
+plt.xlabel("Total energy relative to reference minimum (cm$^{-1}$)", fontsize=12)
+plt.ylabel(r"$k_{\mathrm{WC}}(E)$ (s$^{-1}$)", fontsize=12)
+plt.title("Effective, Intermediate, and MS-specific WC Microcanonical Rates", fontsize=14)
+plt.tick_params(axis="both", labelsize=12)
+plt.grid(False)
+plt.legend()
+save_current_figure(register_plot("WC_effective_intermediate_MS_rates"))
+
+# WC log rates
+plt.figure(figsize=(9.2, 5.2))
+mask_eff_wc = k_WC_effective_micro_s_inv > 0.0
+plt.plot(
+    E_rate_WC_cm1[mask_eff_wc],
+    np.log10(k_WC_effective_micro_s_inv[mask_eff_wc]),
+    linewidth=2.2,
+    color="k",
+    linestyle=":",
+    label=rf"WC $k^{{eff}}$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+)
+
+for key, data in sorted(
+    k_WC_intermediate.items(),
+    key=lambda x: x[1]["abs_Ms_low"]
+):
+    k_int = data["k"][1:]
+    mask = k_int > 0.0
+
+    plt.plot(
+        E_rate_WC_cm1[mask],
+        np.log10(k_int[mask]),
+        linewidth=2.0,
+        linestyle="--",
+        label=(
+            f"WC $k^{{{ms_tex_value(data['abs_Ms_low'])}}}$ "
+            rf"($H_{{\mathrm{{SO}}}}^{{int}}$={data['H_int_cm1']:.1f})"
+        )
+    )
+
+for key, data in sorted(
+    k_WC_channel_groups.items(),
+    key=lambda x: x[1]["H_abs_cm1"],
+    reverse=True
+):
+    k_group = data["k_representative"][1:]
+    mask = k_group > 0.0
+
+    plt.plot(
+        E_rate_WC_cm1[mask],
+        np.log10(k_group[mask]),
+        linewidth=1.5,
+        label=make_rate_group_legend("WC", data)
+    )
+
+plt.axvline(E_MECP, color="k", linestyle="--", linewidth=1.5, label="ZPE-corrected MECP")
+plt.xlabel("Total energy relative to reference minimum (cm$^{-1}$)", fontsize=12)
+plt.ylabel(r"$\log_{10}[k_{\mathrm{WC}}(E)/\mathrm{s}^{-1}]$", fontsize=12)
+plt.title("Log-scale Effective, Intermediate, and MS-specific WC Microcanonical Rates", fontsize=14)
+plt.tick_params(axis="both", labelsize=12)
+plt.grid(False)
+plt.legend()
+save_current_figure(register_plot("WC_effective_intermediate_MS_log_rates"))
+
+# ============================================================
+# Save numerical outputs
+# ============================================================
+
+section("SAVING STEP 9 OUTPUTS")
+
+summary_file_step9 = os.path.join(
+    local_step9,
+    "Step9_rate_summary.txt"
+)
+
+rate_grid_file_step9 = os.path.join(
+    local_step9,
+    "Step9_effective_rate_grid.txt"
+)
+
+channel_rate_summary_file_step9 = os.path.join(
+    local_step9,
+    "Step9_channel_rate_summary.txt"
+)
+
+intermediate_rate_summary_file_step9 = os.path.join(
+    local_step9,
+    "Step9_intermediate_rate_summary.txt"
+)
+
+dos_file_step9 = os.path.join(
+    local_step9,
+    "Step9_DOS_grid.txt"
+)
+
+summary_lines = []
+summary_lines.append("Step 9 effective, intermediate, and MS-specific LZ/WC rates")
+summary_lines.append(f"Run mode = {RUN_MODE}")
+summary_lines.append(f"Workflow mode = {workflow_mode}")
+summary_lines.append("")
+summary_lines.append("[ENERGY]")
+summary_lines.append(f"E_MECP_cm1 = {E_MECP_cm1:.12f}")
+summary_lines.append(f"E_MECP_kJmol = {E_MECP_cm1 * kJmol_per_cm1:.12f}")
+summary_lines.append(f"energy_step_cm1 = {energy_step_cm1:.12f}")
+summary_lines.append(f"maximum_energy_bin_index = {maximum_energy_bin_index}")
+summary_lines.append(f"crossing_energy_bin_index = {crossing_energy_bin_index}")
+summary_lines.append(f"zero_point_bin_offset = {zero_point_bin_offset}")
+summary_lines.append("")
+summary_lines.append("[INPUTS]")
+summary_lines.append(f"H_SO_cm = {float(H_SO_cm):.12f}")
+summary_lines.append(f"GRADIENT_GAP_NORM_EH_PER_BOHR = {float(GRADIENT_GAP_NORM_EH_PER_BOHR):.12e}")
+summary_lines.append(f"reduced_mass_amu = {float(reduced_mass_amu):.12f}")
+summary_lines.append(f"reactant_degeneracy = {reactant_degeneracy:.12f}")
+summary_lines.append(f"Reactant_frequency_count = {len(freq_R)}")
+summary_lines.append(f"MECP_frequency_count = {len(freq_X)}")
+summary_lines.append("")
+summary_lines.append("[EFFECTIVE_RANGES]")
+summary_lines.append(f"P_LZ_min = {np.nanmin(P_LZ_rate_grid):.12e}")
+summary_lines.append(f"P_LZ_max = {np.nanmax(P_LZ_rate_grid):.12e}")
+summary_lines.append(f"k_LZ_min = {np.nanmin(k_LZ_micro_s_inv):.12e}")
+summary_lines.append(f"k_LZ_max = {np.nanmax(k_LZ_micro_s_inv):.12e}")
+summary_lines.append(f"P_WC_min = {np.nanmin(P_WC_rate_grid):.12e}")
+summary_lines.append(f"P_WC_max = {np.nanmax(P_WC_rate_grid):.12e}")
+summary_lines.append(f"k_WC_min = {np.nanmin(k_WC_micro_s_inv):.12e}")
+summary_lines.append(f"k_WC_max = {np.nanmax(k_WC_micro_s_inv):.12e}")
+summary_lines.append("")
+summary_lines.append("[INTERMEDIATE]")
+summary_lines.append(f"LZ_intermediate_curves = {len(k_LZ_intermediate)}")
+summary_lines.append(f"WC_intermediate_curves = {len(k_WC_intermediate)}")
+summary_lines.append("")
+summary_lines.append("[MS_SPECIFIC_CHANNELS]")
+summary_lines.append(f"LZ_individual_channels = {len(k_LZ_channels)}")
+summary_lines.append(f"WC_individual_channels = {len(k_WC_channels)}")
+summary_lines.append(f"LZ_representative_channel_groups = {len(k_LZ_channel_groups)}")
+summary_lines.append(f"WC_representative_channel_groups = {len(k_WC_channel_groups)}")
+summary_lines.append("")
+summary_lines.append("[FILES]")
+summary_lines.append(f"rate_grid_file_step9 = {rate_grid_file_step9}")
+summary_lines.append(f"intermediate_rate_summary_file_step9 = {intermediate_rate_summary_file_step9}")
+summary_lines.append(f"channel_rate_summary_file_step9 = {channel_rate_summary_file_step9}")
+summary_lines.append(f"dos_file_step9 = {dos_file_step9}")
+
+for name, path in plot_files_step9.items():
+    summary_lines.append(f"plot_{name} = {path}")
+
+write_local_text(summary_file_step9, "\n".join(summary_lines) + "\n")
+
+rate_grid_lines = []
+rate_grid_lines.append(
+    "E_cm1  "
+    "P_LZ  gamma_LZ  N_LZ  k_LZ_s_inv  log10_k_LZ  "
+    "P_WC  N_WC  k_WC_s_inv  log10_k_WC"
+)
+
+for i in range(len(E_rate_LZ_cm1)):
+    rate_grid_lines.append(
+        f"{E_rate_LZ_cm1[i]:18.10f} "
+        f"{P_LZ_rate_grid[i]:18.10e} "
+        f"{gamma_LZ_rate_grid[i]:18.10e} "
+        f"{N_MECP_LZ[i]:18.10e} "
+        f"{k_LZ_micro_s_inv[i]:18.10e} "
+        f"{log_k_LZ_raw[i]:18.10e} "
+        f"{P_WC_rate_grid[i]:18.10e} "
+        f"{N_MECP_WC[i]:18.10e} "
+        f"{k_WC_micro_s_inv[i]:18.10e} "
+        f"{log_k_WC_raw[i]:18.10e}"
+    )
+
+write_local_text(rate_grid_file_step9, "\n".join(rate_grid_lines) + "\n")
+
+dos_lines = []
+dos_lines.append("E_cm1  rho_reactant_cm  rho_MECP_shifted_LZ  rho_MECP_internal_WC")
+
+for E, rR, rX, rTP in zip(
+    E_rate_LZ_cm1,
+    rho_reactant_cm,
+    rho_MECP_shifted_plot,
+    rho_MECP_internal_cm
+):
+    dos_lines.append(
+        f"{E:18.10f} "
+        f"{rR:18.10e} "
+        f"{rX:18.10e} "
+        f"{rTP:18.10e}"
+    )
+
+write_local_text(dos_file_step9, "\n".join(dos_lines) + "\n")
+
+intermediate_lines = []
+intermediate_lines.append("Step 9 intermediate rate summary")
+intermediate_lines.append("")
+intermediate_lines.append("[LZ_INTERMEDIATE]")
+intermediate_lines.append("label  abs_Ms_low  degeneracy  H_int_cm1  k_max_s_inv")
+
+for key, data in sorted(
+    k_LZ_intermediate.items(),
+    key=lambda x: x[1]["abs_Ms_low"]
+):
+    intermediate_lines.append(
+        f"{key:20s} "
+        f"{data['abs_Ms_low']:12.6f} "
+        f"{data['degeneracy']:5d} "
+        f"{data['H_int_cm1']:18.10f} "
+        f"{np.nanmax(data['k'][1:]):18.10e}"
+    )
+
+intermediate_lines.append("")
+intermediate_lines.append("[WC_INTERMEDIATE]")
+intermediate_lines.append("label  abs_Ms_low  degeneracy  H_int_cm1  k_max_s_inv")
+
+for key, data in sorted(
+    k_WC_intermediate.items(),
+    key=lambda x: x[1]["abs_Ms_low"]
+):
+    intermediate_lines.append(
+        f"{key:20s} "
+        f"{data['abs_Ms_low']:12.6f} "
+        f"{data['degeneracy']:5d} "
+        f"{data['H_int_cm1']:18.10f} "
+        f"{np.nanmax(data['k'][1:]):18.10e}"
+    )
+
+write_local_text(intermediate_rate_summary_file_step9, "\n".join(intermediate_lines) + "\n")
+
+channel_lines = []
+channel_lines.append("Step 9 representative-group and individual MS-specific channel rate summary")
+channel_lines.append("")
+channel_lines.append("[REPRESENTATIVE_LZ_GROUPS_NO_SUM]")
+channel_lines.append("group_key  H_abs_cm1  equivalent_count  symbols  representative_label  k_max_s_inv  labels")
+
+for key, data in sorted(
+    k_LZ_channel_groups.items(),
+    key=lambda x: x[1]["H_abs_cm1"],
+    reverse=True
+):
+    k_group = data["k_representative"][1:]
+    representative_label_text = format_ms_channel_label_for_text(
+        data["representative_label"]
+    )
+    labels_text = ",".join(
+        format_ms_channel_label_for_text(label)
+        for label in data["labels"]
+    )
+
+    channel_lines.append(
+        f"{key:16s} "
+        f"{data['H_abs_cm1']:18.10f} "
+        f"{data['degeneracy']:5d} "
+        f"{', '.join(data.get('channel_symbols', [])):30s} "
+        f"{representative_label_text:45s} "
+        f"{np.nanmax(k_group):18.10e} "
+        + labels_text
+    )
+
+channel_lines.append("")
+channel_lines.append("[REPRESENTATIVE_WC_GROUPS_NO_SUM]")
+channel_lines.append("group_key  H_abs_cm1  equivalent_count  symbols  representative_label  k_max_s_inv  labels")
+
+for key, data in sorted(
+    k_WC_channel_groups.items(),
+    key=lambda x: x[1]["H_abs_cm1"],
+    reverse=True
+):
+    k_group = data["k_representative"][1:]
+    representative_label_text = format_ms_channel_label_for_text(
+        data["representative_label"]
+    )
+    labels_text = ",".join(
+        format_ms_channel_label_for_text(label)
+        for label in data["labels"]
+    )
+
+    channel_lines.append(
+        f"{key:16s} "
+        f"{data['H_abs_cm1']:18.10f} "
+        f"{data['degeneracy']:5d} "
+        f"{', '.join(data.get('channel_symbols', [])):30s} "
+        f"{representative_label_text:45s} "
+        f"{np.nanmax(k_group):18.10e} "
+        + labels_text
+    )
+
+channel_lines.append("")
+channel_lines.append("[INDIVIDUAL_LZ]")
+channel_lines.append("label  k_max_s_inv")
+
+for label, k_ch in sorted(
+    k_LZ_channels.items(),
+    key=lambda x: np.nanmax(x[1]),
+    reverse=True
+):
+    channel_label_text = format_ms_channel_label_for_text(label)
+    channel_lines.append(
+        f"{channel_label_text:45s} {np.nanmax(k_ch[1:]):18.10e}"
+    )
+
+channel_lines.append("")
+channel_lines.append("[INDIVIDUAL_WC]")
+channel_lines.append("label  k_max_s_inv")
+
+for label, k_ch in sorted(
+    k_WC_channels.items(),
+    key=lambda x: np.nanmax(x[1]),
+    reverse=True
+):
+    channel_label_text = format_ms_channel_label_for_text(label)
+    channel_lines.append(
+        f"{channel_label_text:45s} {np.nanmax(k_ch[1:]):18.10e}"
+    )
+
+write_local_text(channel_rate_summary_file_step9, "\n".join(channel_lines) + "\n")
+
+remote_summary_file_step9 = summary_file_step9
+remote_rate_grid_file_step9 = rate_grid_file_step9
+remote_channel_rate_summary_file_step9 = (
+    channel_rate_summary_file_step9
+)
+remote_intermediate_rate_summary_file_step9 = (
+    intermediate_rate_summary_file_step9
+)
+remote_dos_file_step9 = dos_file_step9
+remote_plot_files_step9 = dict(plot_files_step9)
+
+print(f"Local Step 9 summary              : {summary_file_step9}")
+print(f"Local effective rate grid         : {rate_grid_file_step9}")
+print(
+    f"Local intermediate rate summary   : "
+    f"{intermediate_rate_summary_file_step9}"
+)
+print(
+    f"Local channel rate summary        : "
+    f"{channel_rate_summary_file_step9}"
+)
+print(f"Local DOS grid                    : {dos_file_step9}")
+
+for name, path in plot_files_step9.items():
+    print(f"Local plot {name:40s}: {path}")
+
+print(f"remote_step9 local alias          : {remote_step9}")
+print(
+    f"Step 9 summary alias              : "
+    f"{remote_summary_file_step9}"
+)
+print(
+    f"Effective rate-grid alias         : "
+    f"{remote_rate_grid_file_step9}"
+)
+print(
+    f"Intermediate summary alias        : "
+    f"{remote_intermediate_rate_summary_file_step9}"
+)
+print(
+    f"Channel summary alias             : "
+    f"{remote_channel_rate_summary_file_step9}"
+)
+print(f"DOS-grid alias                    : {remote_dos_file_step9}")
+
+# ============================================================
+# High-energy diagnostic
+# ============================================================
+
+section("HIGH-ENERGY DIAGNOSTIC")
+
+idx_hi = -1
+
+print(f"E_total                          : {E_rate_LZ_cm1[idx_hi]:.3f} cm^-1")
+print(f"P_LZ effective                    : {P_LZ_rate_grid[idx_hi]:.6e}")
+print(f"P_WC effective                    : {P_WC_rate_grid[idx_hi]:.6e}")
+print(f"reactant_state_density                              : {rho_reactant_cm[idx_hi]:.6e}")
+print(f"crossing_shifted_state_density shifted LZ                   : {rho_MECP_shifted_plot[idx_hi]:.6e}")
+print(f"crossing_internal_state_density internal WC                 : {rho_MECP_internal_cm[idx_hi]:.6e}")
+print(f"N_LZ_eff                          : {N_MECP_LZ[idx_hi]:.6e}")
+print(f"N_WC_eff                          : {N_MECP_WC[idx_hi]:.6e}")
+print(f"k_LZ_eff                          : {k_LZ_micro_s_inv[idx_hi]:.6e} s^-1")
+print(f"k_WC_eff                          : {k_WC_micro_s_inv[idx_hi]:.6e} s^-1")
+
+if k_LZ_micro_s_inv[idx_hi] > 0.0:
+    print(f"log10(k_LZ_eff)                   : {np.log10(k_LZ_micro_s_inv[idx_hi]):.6f}")
+
+if k_WC_micro_s_inv[idx_hi] > 0.0:
+    print(f"log10(k_WC_eff)                   : {np.log10(k_WC_micro_s_inv[idx_hi]):.6f}")
+
+# ============================================================
+# Export variables
+# ============================================================
+
+globals().update({
+    "RUN_MODE": RUN_MODE,
+    "workflow_mode": workflow_mode,
+    "VaG_MECP_cm1": VaG_MECP_cm1,
+    "E_MECP": E_MECP,
+    "E_MECP_cm1": E_MECP_cm1,
+    "autocm": autocm,
+    "h_SI": h_SI,
+    "c_SI": c_SI,
+    "Eh_to_J": Eh_to_J,
+    "planck_hsec": planck_hsec,
+    "amu_kg": amu_kg,
+    "bohr_m": bohr_m,
+    "c_cm_s": c_cm_s,
+    "kJmol_per_cm1": kJmol_per_cm1,
+    "energy_step_cm1": energy_step_cm1,
+    "maximum_energy_bin_index": maximum_energy_bin_index,
+    "total_energy_grid_cm1": total_energy_grid_cm1,
+    "crossing_energy_bin_index": crossing_energy_bin_index,
+    "zero_point_bin_offset": zero_point_bin_offset,
+    "reactant_degeneracy": reactant_degeneracy,
+    "freq_R": freq_R,
+    "freq_X": freq_X,
+    "rot_R_cm1": rot_R_cm1,
+    "rot_X_cm1": rot_X_cm1,
+    "reference_principal_inertias": reference_principal_inertias,
+    "crossing_principal_inertias": crossing_principal_inertias,
+    "vibrational_density_reference": vibrational_density_reference,
+    "vibrational_density_crossing": vibrational_density_crossing,
+    "rotational_density_reference": rotational_density_reference,
+    "rotational_density_crossing": rotational_density_crossing,
+    "reactant_state_density": reactant_state_density,
+    "crossing_internal_state_density": crossing_internal_state_density,
+    "crossing_shifted_state_density": crossing_shifted_state_density,
+    "reactant_state_density_independent": reactant_state_density_independent,
+    "crossing_shifted_state_density_independent": crossing_shifted_state_density_independent,
+    "crossing_internal_state_density_independent": crossing_internal_state_density_independent,
+    "compute_landau_zener_probability_for_coupling": compute_landau_zener_probability_for_coupling,
+    "compute_landau_zener_microcanonical_rate": compute_landau_zener_microcanonical_rate,
+    "compute_weak_coupling_microcanonical_rate": compute_weak_coupling_microcanonical_rate,
+    "compute_landau_zener_microcanonical_rate": compute_landau_zener_microcanonical_rate,
+    "effective_LZ_probability": effective_LZ_probability,
+    "effective_LZ_exponent": effective_LZ_exponent,
+    "effective_velocity_bohr_per_s": effective_velocity_bohr_per_s,
+    "effective_LZ_cumulative_states": effective_LZ_cumulative_states,
+    "effective_LZ_rate": effective_LZ_rate,
+    "probLZ": probLZ,
+    "gamma_LZ_rate": gamma_LZ_rate,
+    "LZ_cumulative_states": LZ_cumulative_states,
+    "LZ_rate": LZ_rate,
+    "effective_WC_probability": effective_WC_probability,
+    "effective_WC_airy_argument": effective_WC_airy_argument,
+    "effective_WC_airy_value": effective_WC_airy_value,
+    "effective_WC_cumulative_states": effective_WC_cumulative_states,
+    "effective_WC_rate": effective_WC_rate,
+    "probWC": probWC,
+    "WC_cumulative_states": WC_cumulative_states,
+    "WC_rate": WC_rate,
+    "k_LZ_intermediate": k_LZ_intermediate,
+    "N_LZ_intermediate": N_LZ_intermediate,
+    "P_LZ_intermediate_rate_grid": P_LZ_intermediate_rate_grid,
+    "k_WC_intermediate": k_WC_intermediate,
+    "N_WC_intermediate": N_WC_intermediate,
+    "P_WC_intermediate_rate_grid": P_WC_intermediate_rate_grid,
+    "k_LZ_channels": k_LZ_channels,
+    "N_LZ_channels": N_LZ_channels,
+    "P_LZ_channels_rate_grid": P_LZ_channels_rate_grid,
+    "k_WC_channels": k_WC_channels,
+    "N_WC_channels": N_WC_channels,
+    "P_WC_channels_rate_grid": P_WC_channels_rate_grid,
+    "k_LZ_channel_groups": k_LZ_channel_groups,
+    "N_LZ_channel_groups": N_LZ_channel_groups,
+    "P_LZ_channel_groups_rate_grid": P_LZ_channel_groups_rate_grid,
+    "k_WC_channel_groups": k_WC_channel_groups,
+    "N_WC_channel_groups": N_WC_channel_groups,
+    "P_WC_channel_groups_rate_grid": P_WC_channel_groups_rate_grid,
+    "E_rate_LZ_cm1": E_rate_LZ_cm1,
+    "E_rate_WC_cm1": E_rate_WC_cm1,
+    "rho_reactant_cm": rho_reactant_cm,
+    "rho_MECP_internal_cm": rho_MECP_internal_cm,
+    "rho_MECP_shifted_plot": rho_MECP_shifted_plot,
+    "P_LZ_rate_grid": P_LZ_rate_grid,
+    "gamma_LZ_rate_grid": gamma_LZ_rate_grid,
+    "effective_velocity_bohr_per_s_grid": effective_velocity_bohr_per_s_grid,
+    "N_MECP_LZ": N_MECP_LZ,
+    "k_LZ_micro_s_inv": k_LZ_micro_s_inv,
+    "k_LZ_effective_micro_s_inv": k_LZ_effective_micro_s_inv,
+    "N_MECP_LZ_effective": N_MECP_LZ_effective,
+    "log_k_LZ_raw": log_k_LZ_raw,
+    "E_LZ_log_raw_cm1": E_LZ_log_raw_cm1,
+    "P_WC_rate_grid": P_WC_rate_grid,
+    "N_MECP_WC": N_MECP_WC,
+    "k_WC_micro_s_inv": k_WC_micro_s_inv,
+    "k_WC_effective_micro_s_inv": k_WC_effective_micro_s_inv,
+    "N_MECP_WC_effective": N_MECP_WC_effective,
+    "log_k_WC_raw": log_k_WC_raw,
+    "E_WC_log_raw_cm1": E_WC_log_raw_cm1,
+    "LZ_cumulative_states_independent": LZ_cumulative_states_independent,
+    "LZ_rate_independent": LZ_rate_independent,
+    "WC_cumulative_states_independent": WC_cumulative_states_independent,
+    "WC_rate_independent": WC_rate_independent,
+    "ms_tex_value": ms_tex_value,
+    "make_rate_group_legend": make_rate_group_legend,
+    "local_step9": local_step9,
+    "remote_step9": remote_step9,
+    "plot_files_step9": plot_files_step9,
+    "summary_file_step9": summary_file_step9,
+    "rate_grid_file_step9": rate_grid_file_step9,
+    "intermediate_rate_summary_file_step9": intermediate_rate_summary_file_step9,
+    "channel_rate_summary_file_step9": channel_rate_summary_file_step9,
+    "dos_file_step9": dos_file_step9,
+    "remote_summary_file_step9": remote_summary_file_step9,
+    "remote_rate_grid_file_step9": remote_rate_grid_file_step9,
+    "remote_intermediate_rate_summary_file_step9": remote_intermediate_rate_summary_file_step9,
+    "remote_channel_rate_summary_file_step9": remote_channel_rate_summary_file_step9,
+    "remote_dos_file_step9": remote_dos_file_step9,
+    "remote_plot_files_step9": remote_plot_files_step9
+})
+
+# ============================================================
+# Final summary
+# ============================================================
+
+section("STEP 9 SUMMARY")
+
+print(f"Active MECP barrier               : {E_MECP:.6f} cm^-1")
+print(f"Active MECP barrier               : {E_MECP * kJmol_per_cm1:.6f} kJ/mol")
+print(f"Effective H_SO_cm                 : {float(H_SO_cm):.6f} cm^-1")
+print(f"Reactant frequencies used         : {len(freq_R)}")
+print(f"MECP frequencies used             : {len(freq_X)}")
+print(f"k_LZ effective range              : {np.nanmin(k_LZ_micro_s_inv):.6e} to {np.nanmax(k_LZ_micro_s_inv):.6e}")
+print(f"k_WC effective range              : {np.nanmin(k_WC_micro_s_inv):.6e} to {np.nanmax(k_WC_micro_s_inv):.6e}")
+print(f"LZ intermediate curves            : {len(k_LZ_intermediate)}")
+print(f"WC intermediate curves            : {len(k_WC_intermediate)}")
+print(f"LZ individual MS channels         : {len(k_LZ_channels)}")
+print(f"WC individual MS channels         : {len(k_WC_channels)}")
+print(f"LZ grouped MS channels            : {len(k_LZ_channel_groups)}")
+print(f"WC grouped MS channels            : {len(k_WC_channel_groups)}")
+
+print("\nImportant variables available for Step 10:")
+print("  E_rate_LZ_cm1")
+print("  E_rate_WC_cm1")
+print("  rho_reactant_cm")
+print("  k_LZ_effective_micro_s_inv")
+print("  k_WC_effective_micro_s_inv")
+print("  k_LZ_intermediate")
+print("  k_WC_intermediate")
+print("  k_LZ_channel_groups  # representative curves only; no sum")
+print("  k_WC_channel_groups  # representative curves only; no sum")
+print("  summary_file_step9")
+print("  rate_grid_file_step9")
+print("  intermediate_rate_summary_file_step9")
+print("  channel_rate_summary_file_step9")
+print("  dos_file_step9")
+print("  plot_files_step9")
+
+print("\nSTEP 9 COMPLETED SUCCESSFULLY.\n")
+
+
+#%% STEP 10. Local PC CANONICAL EFFECTIVE, INTERMEDIATE, AND MS-SPECIFIC LZ/WC RATES
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+
+print(r'''
+====================================================================
+ STEP 10 | LOCAL PC VERSION
+ Canonical effective, intermediate, and MS-specific LZ/WC rates
+====================================================================
+
+This step performs Boltzmann averaging of the Step 9 microcanonical rates:
+
+  k(T) = Σ k(E) rho_R(E) exp[-E/(kBT)] ΔE
+         ------------------------------------
+         Σ rho_R(E) exp[-E/(kBT)] ΔE
+
+Outputs include:
+
+  1. Effective canonical LZ/WC rates
+  2. Intermediate canonical LZ/WC rates: k^0, k^1, k^1/2, ...
+  3. Symmetry-collapsed MS-specific canonical LZ/WC rates:
+     k^{Ms_LS,Ms_HS}
+
+Every nonzero MS-specific channel is canonical-averaged independently.
+Channels with identical |H_SO| values generate identical microcanonical
+and canonical rate curves; only one representative curve is plotted for
+such channels. No MS-specific rates are summed.
+''')
+
+# ============================================================
+# Required variables
+# ============================================================
+
+required_vars_step10 = [
+    "jobname",
+    "E_rate_LZ_cm1",
+    "E_rate_WC_cm1",
+    "rho_reactant_cm",
+    "k_LZ_effective_micro_s_inv",
+    "k_WC_effective_micro_s_inv",
+    "local_base",
+    "remote_base"
+]
+
+for var in required_vars_step10:
+    if var not in globals():
+        raise RuntimeError(
+            f"Required variable '{var}' is missing. Run Local PC Step 9 first."
+        )
+
+RUN_MODE = globals().get("RUN_MODE", "LOCAL")
+workflow_mode = "MECP_ONLY"
+
+SOC_EFFECTIVE_ONLY = bool(globals().get("SOC_EFFECTIVE_ONLY", False))
+SOC_MATRIX_CHANNELS_AVAILABLE = bool(globals().get("SOC_MATRIX_CHANNELS_AVAILABLE", True))
+
+if SOC_EFFECTIVE_ONLY or not SOC_MATRIX_CHANNELS_AVAILABLE:
+    print("\nEffective-only SOC mode active.")
+    print("Only effective LZ/WC rates will be computed/plotted.")
+    
+# ============================================================
+# Helpers
+# ============================================================
+
+def section(title):
+    print("\n" + "=" * 72)
+    print(f" {title}")
+    print("=" * 72 + "\n")
+
+
+def ask_float(prompt, default=None, minimum=None):
+    while True:
+        ans = input(prompt).strip()
+
+        if ans == "" and default is not None:
+            val = float(default)
+        else:
+            try:
+                val = float(ans)
+            except ValueError:
+                print("  Please enter a valid numerical value.")
+                continue
+
+        if minimum is not None and val < minimum:
+            print(f"  Please enter a value greater than or equal to {minimum}.")
+            continue
+
+        return val
+
+
+def ask_int(prompt, default=None, minimum=None):
+    while True:
+        ans = input(prompt).strip()
+
+        if ans == "" and default is not None:
+            val = int(default)
+        else:
+            try:
+                val = int(ans)
+            except ValueError:
+                print("  Please enter an integer.")
+                continue
+
+        if minimum is not None and val < minimum:
+            print(f"  Please enter an integer greater than or equal to {minimum}.")
+            continue
+
+        return val
+
+
+def write_local_text(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+def save_current_figure(path):
+    plt.tight_layout()
+    plt.savefig(path, dpi=300)
+    plt.show()
+
+
+def ms_tex_value(x):
+    x = float(x)
+
+    if abs(x - round(x)) < 1.0e-8:
+        return str(int(round(x)))
+
+    if abs(abs(x) - 0.5) < 1.0e-8:
+        return r"\frac{1}{2}" if x > 0 else r"-\frac{1}{2}"
+
+    if abs(abs(x) - 1.5) < 1.0e-8:
+        return r"\frac{3}{2}" if x > 0 else r"-\frac{3}{2}"
+
+    if abs(abs(x) - 2.5) < 1.0e-8:
+        return r"\frac{5}{2}" if x > 0 else r"-\frac{5}{2}"
+
+    if abs(abs(x) - 3.5) < 1.0e-8:
+        return r"\frac{7}{2}" if x > 0 else r"-\frac{7}{2}"
+
+    return f"{x:.1f}"
+
+
+def make_canonical_group_legend(prefix, group_data):
+    """
+    Build a legend for one representative MS-specific canonical curve.
+
+    Multiple symbols indicate symmetry-equivalent channels with identical
+    |H_SO| values and therefore identical canonical rates. Commas indicate
+    coincident curves; no summation is implied.
+    """
+    symbols = group_data.get("channel_symbols", [])
+    H_abs = float(group_data["H_abs_cm1"])
+
+    rate_symbols = [sym.replace("$P", "$k") for sym in symbols]
+
+    if len(rate_symbols) == 0:
+        return rf"{prefix} MS ($|H_{{\mathrm{{SO}}}}|$={H_abs:.1f})"
+
+    if len(rate_symbols) <= 3:
+        return (
+            f"{prefix} "
+            + ", ".join(rate_symbols)
+            + rf" ($|H_{{\mathrm{{SO}}}}|$={H_abs:.1f})"
+        )
+
+    return (
+        f"{prefix} "
+        + ", ".join(rate_symbols[:3])
+        + rf", ... ($|H_{{\mathrm{{SO}}}}|$={H_abs:.1f}), "
+        + f"equivalent channels={len(rate_symbols)}"
+    )
+
+
+# ============================================================
+# Temperature grid
+# ============================================================
+
+section("CANONICAL TEMPERATURE GRID")
+
+kB_cm1_per_K = 0.695034800
+
+print("Canonical averaging formula:")
+print("  k(T) = Σ k(E) rho_R(E) exp[-E/(kBT)] ΔE / Σ rho_R(E) exp[-E/(kBT)] ΔE")
+print("  Energies are relative to the reactant/reference minimum in cm^-1.\n")
+
+T_min = ask_float(
+    "Minimum temperature for canonical rates, K, e.g. 100: ",
+    minimum=1.0e-12
+)
+
+T_max = ask_float(
+    "Maximum temperature for canonical rates, K, e.g. 1000: ",
+    minimum=1.0e-12
+)
+
+nT = ask_int(
+    "Number of temperature points, e.g. 100: ",
+    minimum=2
+)
+
+if T_max <= T_min:
+    raise RuntimeError("Invalid temperature range: T_max must be greater than T_min.")
+
+T_grid_K = np.linspace(T_min, T_max, nT)
+
+E_rate_LZ_cm1 = np.asarray(E_rate_LZ_cm1, dtype=float).reshape(-1)
+E_rate_WC_cm1 = np.asarray(E_rate_WC_cm1, dtype=float).reshape(-1)
+rho_reactant_cm = np.asarray(rho_reactant_cm, dtype=float).reshape(-1)
+
+k_LZ_effective_micro_s_inv = np.asarray(
+    k_LZ_effective_micro_s_inv,
+    dtype=float
+).reshape(-1)
+
+k_WC_effective_micro_s_inv = np.asarray(
+    k_WC_effective_micro_s_inv,
+    dtype=float
+).reshape(-1)
+
+if E_rate_LZ_cm1.size != rho_reactant_cm.size:
+    raise RuntimeError("E_rate_LZ_cm1 and rho_reactant_cm have different sizes.")
+
+if E_rate_WC_cm1.size != rho_reactant_cm.size:
+    raise RuntimeError("E_rate_WC_cm1 and rho_reactant_cm have different sizes.")
+
+if E_rate_LZ_cm1.size != k_LZ_effective_micro_s_inv.size:
+    raise RuntimeError("E_rate_LZ_cm1 and k_LZ_effective_micro_s_inv have different sizes.")
+
+if E_rate_WC_cm1.size != k_WC_effective_micro_s_inv.size:
+    raise RuntimeError("E_rate_WC_cm1 and k_WC_effective_micro_s_inv have different sizes.")
+
+dE_LZ = float(np.mean(np.diff(E_rate_LZ_cm1))) if E_rate_LZ_cm1.size > 1 else 1.0
+dE_WC = float(np.mean(np.diff(E_rate_WC_cm1))) if E_rate_WC_cm1.size > 1 else 1.0
+
+print(f"RUN_MODE                      : {RUN_MODE}")
+print(f"workflow_mode                 : {workflow_mode}")
+print(f"T range                       : {T_grid_K[0]:.3f} to {T_grid_K[-1]:.3f} K")
+print(f"Number of T points            : {nT}")
+print(f"dE_LZ                         : {dE_LZ:.6f} cm^-1")
+print(f"dE_WC                         : {dE_WC:.6f} cm^-1")
+print(f"LZ energy grid                : {E_rate_LZ_cm1[0]:.3f} to {E_rate_LZ_cm1[-1]:.3f} cm^-1")
+print(f"WC energy grid                : {E_rate_WC_cm1[0]:.3f} to {E_rate_WC_cm1[-1]:.3f} cm^-1")
+
+# ============================================================
+# Boltzmann averaging helper
+# ============================================================
+
+section("BOLTZMANN AVERAGING HELPER")
+
+def boltzmann_average_microcanonical_rate(
+    energy_cm1,
+    state_density,
+    microcanonical_rate,
+    temperature_grid_K,
+    energy_spacing_cm1
+):
+    energy_cm1 = np.asarray(energy_cm1, dtype=float).reshape(-1)
+    state_density = np.asarray(state_density, dtype=float).reshape(-1)
+    microcanonical_rate = np.asarray(
+        microcanonical_rate,
+        dtype=float
+    ).reshape(-1)
+    temperature_grid_K = np.asarray(
+        temperature_grid_K,
+        dtype=float
+    ).reshape(-1)
+
+    if (
+        energy_cm1.shape != state_density.shape
+        or energy_cm1.shape != microcanonical_rate.shape
+    ):
+        raise RuntimeError(
+            "Energy, state-density, and microcanonical-rate arrays "
+            "must have the same shape."
+        )
+
+    thermal_energy_cm1 = kB_cm1_per_K * temperature_grid_K
+
+    canonical_rate = np.zeros_like(temperature_grid_K, dtype=float)
+    normalization_integral = np.zeros_like(
+        temperature_grid_K,
+        dtype=float
+    )
+
+    for temperature_index, thermal_energy in enumerate(
+        thermal_energy_cm1
+    ):
+        boltzmann_weight = np.exp(-energy_cm1 / thermal_energy)
+
+        denominator = np.sum(
+            state_density * boltzmann_weight
+        ) * energy_spacing_cm1
+        numerator = np.sum(
+            microcanonical_rate
+            * state_density
+            * boltzmann_weight
+        ) * energy_spacing_cm1
+
+        normalization_integral[temperature_index] = denominator
+
+        if denominator > 0.0 and np.isfinite(denominator):
+            canonical_rate[temperature_index] = numerator / denominator
+        else:
+            canonical_rate[temperature_index] = 0.0
+
+    canonical_rate[~np.isfinite(canonical_rate)] = 0.0
+    canonical_rate = np.clip(canonical_rate, 0.0, None)
+
+    return canonical_rate, normalization_integral
+
+
+print("boltzmann_average_microcanonical_rate prepared.")
+
+# ============================================================
+# Effective canonical rates
+# ============================================================
+
+section("EFFECTIVE CANONICAL LZ/WC RATES")
+
+k_LZ_canonical_s_inv, LZ_canonical_normalization = boltzmann_average_microcanonical_rate(
+    E_rate_LZ_cm1,
+    rho_reactant_cm,
+    k_LZ_effective_micro_s_inv,
+    T_grid_K,
+    dE_LZ
+)
+
+k_WC_canonical_s_inv, WC_canonical_normalization = boltzmann_average_microcanonical_rate(
+    E_rate_WC_cm1,
+    rho_reactant_cm,
+    k_WC_effective_micro_s_inv,
+    T_grid_K,
+    dE_WC
+)
+
+kcanon_LZ = k_LZ_canonical_s_inv
+kcanon_WC = k_WC_canonical_s_inv
+
+print(f"k_LZ canonical range        : {np.nanmin(k_LZ_canonical_s_inv):.6e} to {np.nanmax(k_LZ_canonical_s_inv):.6e} s^-1")
+print(f"k_WC canonical range        : {np.nanmin(k_WC_canonical_s_inv):.6e} to {np.nanmax(k_WC_canonical_s_inv):.6e} s^-1")
+
+# ============================================================
+# Intermediate canonical rates
+# ============================================================
+
+section("CANONICAL INTERMEDIATE RATES")
+
+k_LZ_intermediate_canonical = {}
+k_WC_intermediate_canonical = {}
+
+if "k_LZ_intermediate" in globals() and len(k_LZ_intermediate) > 0:
+    for key, data in k_LZ_intermediate.items():
+        k_E = np.asarray(data["k"][1:], dtype=float).reshape(-1)
+
+        if k_E.size == E_rate_LZ_cm1.size:
+            k_T, _ = boltzmann_average_microcanonical_rate(
+                E_rate_LZ_cm1,
+                rho_reactant_cm,
+                k_E,
+                T_grid_K,
+                dE_LZ
+            )
+
+            k_LZ_intermediate_canonical[key] = {
+                "H_int_cm1": data["H_int_cm1"],
+                "abs_Ms_low": data["abs_Ms_low"],
+                "degeneracy": data["degeneracy"],
+                "k_T": k_T
+            }
+
+if "k_WC_intermediate" in globals() and len(k_WC_intermediate) > 0:
+    for key, data in k_WC_intermediate.items():
+        k_E = np.asarray(data["k"][1:], dtype=float).reshape(-1)
+
+        if k_E.size == E_rate_WC_cm1.size:
+            k_T, _ = boltzmann_average_microcanonical_rate(
+                E_rate_WC_cm1,
+                rho_reactant_cm,
+                k_E,
+                T_grid_K,
+                dE_WC
+            )
+
+            k_WC_intermediate_canonical[key] = {
+                "H_int_cm1": data["H_int_cm1"],
+                "abs_Ms_low": data["abs_Ms_low"],
+                "degeneracy": data["degeneracy"],
+                "k_T": k_T
+            }
+
+print(f"LZ intermediate canonical curves : {len(k_LZ_intermediate_canonical)}")
+print(f"WC intermediate canonical curves : {len(k_WC_intermediate_canonical)}")
+
+# ============================================================
+# Symmetry-collapsed MS-specific canonical rates
+# ============================================================
+
+section("CANONICAL SYMMETRY-COLLAPSED MS-SPECIFIC RATES")
+
+# Step 9 stores one representative microcanonical rate curve for every
+# set of channels having identical |H_SO| values. Here each representative
+# curve is canonical-averaged directly. No channel rates are summed.
+
+k_LZ_channel_groups_canonical = {}
+k_WC_channel_groups_canonical = {}
+
+if "k_LZ_channel_groups" in globals() and len(k_LZ_channel_groups) > 0:
+    for key, data in k_LZ_channel_groups.items():
+        if "k_representative" not in data:
+            raise RuntimeError(
+                f"LZ channel group {key} does not contain "
+                "'k_representative'. Run the modified Step 9 first."
+            )
+
+        k_group_E = np.asarray(
+            data["k_representative"][1:],
+            dtype=float
+        ).reshape(-1)
+
+        if k_group_E.size != E_rate_LZ_cm1.size:
+            raise RuntimeError(
+                f"LZ representative group {key} has length "
+                f"{k_group_E.size}, expected {E_rate_LZ_cm1.size}."
+            )
+
+        k_group_T, _ = boltzmann_average_microcanonical_rate(
+            E_rate_LZ_cm1,
+            rho_reactant_cm,
+            k_group_E,
+            T_grid_K,
+            dE_LZ
+        )
+
+        k_LZ_channel_groups_canonical[key] = {
+            "H_abs_cm1": float(data["H_abs_cm1"]),
+            "degeneracy": int(data.get("degeneracy", 1)),
+            "channel_symbols": list(
+                data.get("channel_symbols", [])
+            ),
+            "labels": list(data.get("labels", [])),
+            "representative_label": data.get(
+                "representative_label"
+            ),
+            "combination_rule": "representative_only_no_sum",
+            "k_T": k_group_T
+        }
+
+if "k_WC_channel_groups" in globals() and len(k_WC_channel_groups) > 0:
+    for key, data in k_WC_channel_groups.items():
+        if "k_representative" not in data:
+            raise RuntimeError(
+                f"WC channel group {key} does not contain "
+                "'k_representative'. Run the modified Step 9 first."
+            )
+
+        k_group_E = np.asarray(
+            data["k_representative"][1:],
+            dtype=float
+        ).reshape(-1)
+
+        if k_group_E.size != E_rate_WC_cm1.size:
+            raise RuntimeError(
+                f"WC representative group {key} has length "
+                f"{k_group_E.size}, expected {E_rate_WC_cm1.size}."
+            )
+
+        k_group_T, _ = boltzmann_average_microcanonical_rate(
+            E_rate_WC_cm1,
+            rho_reactant_cm,
+            k_group_E,
+            T_grid_K,
+            dE_WC
+        )
+
+        k_WC_channel_groups_canonical[key] = {
+            "H_abs_cm1": float(data["H_abs_cm1"]),
+            "degeneracy": int(data.get("degeneracy", 1)),
+            "channel_symbols": list(
+                data.get("channel_symbols", [])
+            ),
+            "labels": list(data.get("labels", [])),
+            "representative_label": data.get(
+                "representative_label"
+            ),
+            "combination_rule": "representative_only_no_sum",
+            "k_T": k_group_T
+        }
+
+print(
+    f"Representative LZ MS-specific canonical curves : "
+    f"{len(k_LZ_channel_groups_canonical)}"
+)
+print(
+    f"Representative WC MS-specific canonical curves : "
+    f"{len(k_WC_channel_groups_canonical)}"
+)
+print("MS-specific canonical combination rule          : no summation")
+
+# ============================================================
+# Plots
+# ============================================================
+
+section("PLOTTING CANONICAL RATES")
+
+local_step10 = os.path.join(local_base, "Canonical_rates")
+os.makedirs(local_step10, exist_ok=True)
+
+# Local PC compatibility alias. No remote directory is created.
+remote_step10 = local_step10
+
+plot_files_step10 = {}
+
+def register_plot(name):
+    path = os.path.join(local_step10, f"Step10_{name}.png")
+    plot_files_step10[name] = path
+    return path
+
+# ----------------------------
+# k(T) plot
+# ----------------------------
+
+plt.figure(figsize=(9.2, 5.2))
+plt.plot(T_grid_K, k_LZ_canonical_s_inv, linewidth=2.8, linestyle=":", color="k", zorder=3, label=rf"LZ $k^{{eff}}$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})")
+plt.plot(T_grid_K, k_WC_canonical_s_inv, linewidth=2.8, linestyle="-", color="k", zorder=4, label=rf"WC $k^{{eff}}$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})")
+
+for key, data in sorted(
+    k_LZ_intermediate_canonical.items(),
+    key=lambda x: x[1]["abs_Ms_low"]
+):
+    plt.plot(
+        T_grid_K,
+        data["k_T"],
+        linewidth=2.0,
+        linestyle="--",
+        label=(
+            f"LZ $k^{{{ms_tex_value(data['abs_Ms_low'])}}}$ "
+            rf"($H_{{\mathrm{{SO}}}}^{{int}}$={data['H_int_cm1']:.1f})"
+        )
+    )
+
+for key, data in sorted(
+    k_WC_intermediate_canonical.items(),
+    key=lambda x: x[1]["abs_Ms_low"]
+):
+    plt.plot(
+        T_grid_K,
+        data["k_T"],
+        linewidth=2.0,
+        linestyle="--",
+        label=(
+            f"WC $k^{{{ms_tex_value(data['abs_Ms_low'])}}}$ "
+            rf"($H_{{\mathrm{{SO}}}}^{{int}}$={data['H_int_cm1']:.1f})"
+        )
+    )
+
+for key, data in sorted(
+    k_LZ_channel_groups_canonical.items(),
+    key=lambda x: x[1]["H_abs_cm1"],
+    reverse=True
+):
+    plt.plot(
+        T_grid_K,
+        data["k_T"],
+        linewidth=1.4,
+        label=make_canonical_group_legend("LZ", data)
+    )
+
+for key, data in sorted(
+    k_WC_channel_groups_canonical.items(),
+    key=lambda x: x[1]["H_abs_cm1"],
+    reverse=True
+):
+    plt.plot(
+        T_grid_K,
+        data["k_T"],
+        linewidth=1.4,
+        label=make_canonical_group_legend("WC", data)
+    )
+
+plt.xlabel("Temperature (K)", fontsize=12)
+plt.ylabel(r"$k(T)$ (s$^{-1}$)", fontsize=12)
+plt.title("Canonical Effective, Intermediate, and MS-specific LZ/WC Rates", fontsize=14)
+plt.tick_params(axis="both", labelsize=12)
+plt.grid(False)
+plt.legend()
+save_current_figure(register_plot("canonical_effective_intermediate_MS_rates"))
+
+# ----------------------------
+# Log-scale canonical plot
+# ----------------------------
+
+plt.figure(figsize=(9.2, 5.2))
+
+mask_lz = k_LZ_canonical_s_inv > 0.0
+mask_wc = k_WC_canonical_s_inv > 0.0
+
+plt.plot(
+    1000.0 / T_grid_K[mask_lz],
+    np.log10(k_LZ_canonical_s_inv[mask_lz]),
+    linewidth=2.3,
+    linestyle=":",
+    color="k",
+    zorder=3,
+    label=rf"LZ $k^{{eff}}$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+)
+
+plt.plot(
+    1000.0 / T_grid_K[mask_wc],
+    np.log10(k_WC_canonical_s_inv[mask_wc]),
+    linewidth=2.3,
+    linestyle="-",
+    color="k",
+    zorder=4,
+    label=rf"WC $k^{{eff}}$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+)
+
+for key, data in sorted(
+    k_LZ_intermediate_canonical.items(),
+    key=lambda x: x[1]["abs_Ms_low"]
+):
+    k_T = data["k_T"]
+    mask = k_T > 0.0
+
+    plt.plot(
+        1000.0 / T_grid_K[mask],
+        np.log10(k_T[mask]),
+        linewidth=2.0,
+        linestyle="--",
+        label=(
+            f"LZ $k^{{{ms_tex_value(data['abs_Ms_low'])}}}$ "
+            rf"($H_{{\mathrm{{SO}}}}^{{int}}$={data['H_int_cm1']:.1f})"
+        )
+    )
+
+for key, data in sorted(
+    k_WC_intermediate_canonical.items(),
+    key=lambda x: x[1]["abs_Ms_low"]
+):
+    k_T = data["k_T"]
+    mask = k_T > 0.0
+
+    plt.plot(
+        1000.0 / T_grid_K[mask],
+        np.log10(k_T[mask]),
+        linewidth=2.0,
+        linestyle="--",
+        label=(
+            f"WC $k^{{{ms_tex_value(data['abs_Ms_low'])}}}$ "
+            rf"($H_{{\mathrm{{SO}}}}^{{int}}$={data['H_int_cm1']:.1f})"
+        )
+    )
+
+for key, data in sorted(
+    k_LZ_channel_groups_canonical.items(),
+    key=lambda x: x[1]["H_abs_cm1"],
+    reverse=True
+):
+    k_T = data["k_T"]
+    mask = k_T > 0.0
+
+    plt.plot(
+        1000.0 / T_grid_K[mask],
+        np.log10(k_T[mask]),
+        linewidth=1.4,
+        label=make_canonical_group_legend("LZ", data)
+    )
+
+for key, data in sorted(
+    k_WC_channel_groups_canonical.items(),
+    key=lambda x: x[1]["H_abs_cm1"],
+    reverse=True
+):
+    k_T = data["k_T"]
+    mask = k_T > 0.0
+
+    plt.plot(
+        1000.0 / T_grid_K[mask],
+        np.log10(k_T[mask]),
+        linewidth=1.4,
+        label=make_canonical_group_legend("WC", data)
+    )
+
+plt.xlabel(r"$1000/T$ (K$^{-1}$)", fontsize=12)
+plt.ylabel(r"$\log_{10}[k(T)/\mathrm{s}^{-1}]$", fontsize=12)
+plt.title("Log-scale Canonical Effective, Intermediate, and MS-specific LZ/WC Rates", fontsize=14)
+plt.tick_params(axis="both", labelsize=12)
+plt.grid(False)
+plt.legend()
+save_current_figure(register_plot("log_scale_canonical_effective_intermediate_MS_rates"))
+
+# ============================================================
+# Save tables
+# ============================================================
+
+section("SAVING STEP 10 OUTPUTS")
+
+canonical_rate_file = os.path.join(
+    local_step10,
+    "Step10_canonical_LZ_WC_rates.txt"
+)
+
+summary_file_step10 = os.path.join(
+    local_step10,
+    "Step10_canonical_rate_summary.txt"
+)
+
+intermediate_canonical_file_step10 = os.path.join(
+    local_step10,
+    "Step10_intermediate_canonical_rates.txt"
+)
+
+representative_canonical_file_step10 = os.path.join(
+    local_step10,
+    "Step10_representative_MS_canonical_rates.txt"
+)
+
+table_columns = [
+    T_grid_K,
+    1000.0 / T_grid_K,
+    k_LZ_canonical_s_inv,
+    k_WC_canonical_s_inv,
+    LZ_canonical_normalization,
+    WC_canonical_normalization
+]
+
+header_items = [
+    "T_K",
+    "1000_over_T_Kinv",
+    "k_LZ_effective_s^-1",
+    "k_WC_effective_s^-1",
+    "LZ_canonical_normalization",
+    "WC_canonical_normalization"
+]
+
+canonical_rate_table = np.column_stack(table_columns)
+canonical_rate_header = "  ".join(header_items)
+
+np.savetxt(
+    canonical_rate_file,
+    canonical_rate_table,
+    header=canonical_rate_header,
+    fmt="%.10e"
+)
+
+summary_lines = []
+summary_lines.append("Step 10 canonical effective, intermediate, and MS-specific LZ/WC rate constants")
+summary_lines.append(f"Run mode = {RUN_MODE}")
+summary_lines.append(f"Workflow mode = {workflow_mode}")
+summary_lines.append("")
+summary_lines.append("[TEMPERATURE_GRID]")
+summary_lines.append(f"T_min_K = {T_grid_K[0]:.12f}")
+summary_lines.append(f"T_max_K = {T_grid_K[-1]:.12f}")
+summary_lines.append(f"nT = {nT}")
+summary_lines.append("")
+summary_lines.append("[ENERGY_GRID]")
+summary_lines.append(f"dE_LZ_cm1 = {dE_LZ:.12f}")
+summary_lines.append(f"dE_WC_cm1 = {dE_WC:.12f}")
+summary_lines.append(f"E_LZ_min_cm1 = {E_rate_LZ_cm1[0]:.12f}")
+summary_lines.append(f"E_LZ_max_cm1 = {E_rate_LZ_cm1[-1]:.12f}")
+summary_lines.append(f"E_WC_min_cm1 = {E_rate_WC_cm1[0]:.12f}")
+summary_lines.append(f"E_WC_max_cm1 = {E_rate_WC_cm1[-1]:.12f}")
+summary_lines.append("")
+summary_lines.append("[EFFECTIVE_CANONICAL_RANGES]")
+summary_lines.append(f"k_LZ_min_s_inv = {np.nanmin(k_LZ_canonical_s_inv):.12e}")
+summary_lines.append(f"k_LZ_max_s_inv = {np.nanmax(k_LZ_canonical_s_inv):.12e}")
+summary_lines.append(f"k_WC_min_s_inv = {np.nanmin(k_WC_canonical_s_inv):.12e}")
+summary_lines.append(f"k_WC_max_s_inv = {np.nanmax(k_WC_canonical_s_inv):.12e}")
+summary_lines.append("")
+summary_lines.append("[INTERMEDIATE]")
+summary_lines.append(f"LZ_intermediate_canonical_count = {len(k_LZ_intermediate_canonical)}")
+summary_lines.append(f"WC_intermediate_canonical_count = {len(k_WC_intermediate_canonical)}")
+summary_lines.append("")
+summary_lines.append("[MS_SPECIFIC_REPRESENTATIVE_GROUPS_NO_SUM]")
+summary_lines.append(f"LZ_representative_canonical_count = {len(k_LZ_channel_groups_canonical)}")
+summary_lines.append(f"WC_representative_canonical_count = {len(k_WC_channel_groups_canonical)}")
+summary_lines.append("")
+summary_lines.append("[FILES]")
+summary_lines.append(f"canonical_rate_file = {canonical_rate_file}")
+summary_lines.append(f"intermediate_canonical_file_step10 = {intermediate_canonical_file_step10}")
+summary_lines.append(f"representative_canonical_file_step10 = {representative_canonical_file_step10}")
+
+for name, path in plot_files_step10.items():
+    summary_lines.append(f"plot_{name} = {path}")
+
+write_local_text(summary_file_step10, "\n".join(summary_lines) + "\n")
+
+intermediate_lines = []
+intermediate_lines.append("Step 10 intermediate canonical rates")
+intermediate_lines.append("")
+intermediate_lines.append("[LZ_INTERMEDIATE]")
+intermediate_lines.append("label  abs_Ms_low  degeneracy  H_int_cm1  k_min_s_inv  k_max_s_inv")
+
+for key, data in sorted(
+    k_LZ_intermediate_canonical.items(),
+    key=lambda x: x[1]["abs_Ms_low"]
+):
+    kT = data["k_T"]
+
+    intermediate_lines.append(
+        f"{key:20s} "
+        f"{data['abs_Ms_low']:12.6f} "
+        f"{data['degeneracy']:5d} "
+        f"{data['H_int_cm1']:18.10f} "
+        f"{np.nanmin(kT):18.10e} "
+        f"{np.nanmax(kT):18.10e}"
+    )
+
+intermediate_lines.append("")
+intermediate_lines.append("[WC_INTERMEDIATE]")
+intermediate_lines.append("label  abs_Ms_low  degeneracy  H_int_cm1  k_min_s_inv  k_max_s_inv")
+
+for key, data in sorted(
+    k_WC_intermediate_canonical.items(),
+    key=lambda x: x[1]["abs_Ms_low"]
+):
+    kT = data["k_T"]
+
+    intermediate_lines.append(
+        f"{key:20s} "
+        f"{data['abs_Ms_low']:12.6f} "
+        f"{data['degeneracy']:5d} "
+        f"{data['H_int_cm1']:18.10f} "
+        f"{np.nanmin(kT):18.10e} "
+        f"{np.nanmax(kT):18.10e}"
+    )
+
+write_local_text(intermediate_canonical_file_step10, "\n".join(intermediate_lines) + "\n")
+
+representative_lines = []
+representative_lines.append("Step 10 representative MS-specific canonical rates; no summation")
+representative_lines.append("")
+representative_lines.append("[LZ_REPRESENTATIVE_GROUPS_NO_SUM]")
+representative_lines.append("group_key  H_abs_cm1  equivalent_count  symbols  representative_label  k_min_s_inv  k_max_s_inv")
+
+for key, data in sorted(
+    k_LZ_channel_groups_canonical.items(),
+    key=lambda x: x[1]["H_abs_cm1"],
+    reverse=True
+):
+    kT = data["k_T"]
+
+    representative_label_text = format_ms_channel_label_for_text(
+        data.get("representative_label")
+    )
+
+    representative_lines.append(
+        f"{key:16s} "
+        f"{data['H_abs_cm1']:18.10f} "
+        f"{data['degeneracy']:5d} "
+        f"{', '.join(data.get('channel_symbols', [])):30s} "
+        f"{representative_label_text:45s} "
+        f"{np.nanmin(kT):18.10e} "
+        f"{np.nanmax(kT):18.10e}"
+    )
+
+representative_lines.append("")
+representative_lines.append("[WC_REPRESENTATIVE_GROUPS_NO_SUM]")
+representative_lines.append("group_key  H_abs_cm1  equivalent_count  symbols  representative_label  k_min_s_inv  k_max_s_inv")
+
+for key, data in sorted(
+    k_WC_channel_groups_canonical.items(),
+    key=lambda x: x[1]["H_abs_cm1"],
+    reverse=True
+):
+    kT = data["k_T"]
+
+    representative_label_text = format_ms_channel_label_for_text(
+        data.get("representative_label")
+    )
+
+    representative_lines.append(
+        f"{key:16s} "
+        f"{data['H_abs_cm1']:18.10f} "
+        f"{data['degeneracy']:5d} "
+        f"{', '.join(data.get('channel_symbols', [])):30s} "
+        f"{representative_label_text:45s} "
+        f"{np.nanmin(kT):18.10e} "
+        f"{np.nanmax(kT):18.10e}"
+    )
+
+write_local_text(
+    representative_canonical_file_step10,
+    "\n".join(representative_lines) + "\n"
+)
+
+remote_canonical_rate_file = canonical_rate_file
+remote_summary_file_step10 = summary_file_step10
+remote_intermediate_canonical_file_step10 = (
+    intermediate_canonical_file_step10
+)
+remote_representative_canonical_file_step10 = (
+    representative_canonical_file_step10
+)
+remote_plot_files_step10 = dict(plot_files_step10)
+
+print(f"Local canonical rate file          : {canonical_rate_file}")
+print(f"Local Step 10 summary              : {summary_file_step10}")
+print(
+    f"Local intermediate canonical file  : "
+    f"{intermediate_canonical_file_step10}"
+)
+print(
+    f"Local representative MS file       : "
+    f"{representative_canonical_file_step10}"
+)
+
+for name, path in plot_files_step10.items():
+    print(f"Local plot {name:40s}: {path}")
+
+print(f"remote_step10 local alias          : {remote_step10}")
+print(
+    f"Canonical rate-file alias          : "
+    f"{remote_canonical_rate_file}"
+)
+print(
+    f"Step 10 summary alias              : "
+    f"{remote_summary_file_step10}"
+)
+print(
+    f"Intermediate canonical alias       : "
+    f"{remote_intermediate_canonical_file_step10}"
+)
+print(
+    f"Representative canonical alias     : "
+    f"{remote_representative_canonical_file_step10}"
+)
+
+# ============================================================
+# Export variables
+# ============================================================
+
+globals().update({
+    "RUN_MODE": RUN_MODE,
+    "workflow_mode": workflow_mode,
+    "kB_cm1_per_K": kB_cm1_per_K,
+    "T_grid_K": T_grid_K,
+    "T_min": T_min,
+    "T_max": T_max,
+    "nT": nT,
+    "dE_LZ": dE_LZ,
+    "dE_WC": dE_WC,
+    "boltzmann_average_microcanonical_rate": boltzmann_average_microcanonical_rate,
+
+    "k_LZ_canonical_s_inv": k_LZ_canonical_s_inv,
+    "k_WC_canonical_s_inv": k_WC_canonical_s_inv,
+    "kcanon_LZ": kcanon_LZ,
+    "kcanon_WC": kcanon_WC,
+    "LZ_canonical_normalization": LZ_canonical_normalization,
+    "WC_canonical_normalization": WC_canonical_normalization,
+
+    "k_LZ_intermediate_canonical": k_LZ_intermediate_canonical,
+    "k_WC_intermediate_canonical": k_WC_intermediate_canonical,
+    "k_LZ_channel_groups_canonical": k_LZ_channel_groups_canonical,
+    "k_WC_channel_groups_canonical": k_WC_channel_groups_canonical,
+
+    "ms_tex_value": ms_tex_value,
+    "make_canonical_group_legend": make_canonical_group_legend,
+
+    "local_step10": local_step10,
+    "remote_step10": remote_step10,
+    "plot_files_step10": plot_files_step10,
+    "canonical_rate_file": canonical_rate_file,
+    "summary_file_step10": summary_file_step10,
+    "intermediate_canonical_file_step10": intermediate_canonical_file_step10,
+    "representative_canonical_file_step10": representative_canonical_file_step10,
+    "remote_canonical_rate_file": remote_canonical_rate_file,
+    "remote_summary_file_step10": remote_summary_file_step10,
+    "remote_intermediate_canonical_file_step10": remote_intermediate_canonical_file_step10,
+    "remote_representative_canonical_file_step10": remote_representative_canonical_file_step10,
+    "remote_plot_files_step10": remote_plot_files_step10
+})
+
+# ============================================================
+# Final summary
+# ============================================================
+
+section("STEP 10 SUMMARY")
+
+print(f"T range                         : {T_grid_K[0]:.2f} to {T_grid_K[-1]:.2f} K")
+print(f"k_LZ effective canonical         : {np.nanmin(k_LZ_canonical_s_inv):.6e} to {np.nanmax(k_LZ_canonical_s_inv):.6e} s^-1")
+print(f"k_WC effective canonical         : {np.nanmin(k_WC_canonical_s_inv):.6e} to {np.nanmax(k_WC_canonical_s_inv):.6e} s^-1")
+print(f"LZ intermediate canonical curves : {len(k_LZ_intermediate_canonical)}")
+print(f"WC intermediate canonical curves : {len(k_WC_intermediate_canonical)}")
+print(f"LZ representative MS curves      : {len(k_LZ_channel_groups_canonical)}")
+print(f"WC representative MS curves      : {len(k_WC_channel_groups_canonical)}")
+
+print("\nImportant variables available for later steps:")
+print("  T_grid_K")
+print("  k_LZ_canonical_s_inv")
+print("  k_WC_canonical_s_inv")
+print("  k_LZ_intermediate_canonical")
+print("  k_WC_intermediate_canonical")
+print("  k_LZ_channel_groups_canonical")
+print("  k_WC_channel_groups_canonical")
+print("  canonical_rate_file")
+print("  summary_file_step10")
+print("  intermediate_canonical_file_step10")
+print("  representative_canonical_file_step10")
+print("  plot_files_step10")
+
+print("\nSTEP 10 COMPLETED SUCCESSFULLY.\n")
+
+
+#%% STEP 11. Local PC CONDITIONAL WC THRESHOLD-TRUNCATION CORRECTION
+
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.special import airy
+
+print(r'''
+====================================================================
+ STEP 11 | LOCAL PC CONDITIONAL WC THRESHOLD-TRUNCATION CORRECTION
+====================================================================
+
+This step first examines the raw weak-coupling probability.
+
+If raw P_WC never reaches 1:
+  - no CORRECTED-prefixed WC variables are produced
+  - no WC rates are recomputed
+  - no plots are generated
+  - no files are saved
+
+If raw P_WC >= 1:
+  - threshold-truncation rule is applied
+  - P_WC is set to zero from the first unphysical point onward
+  - WC probabilities, microcanonical rates, canonical rates,
+    intermediate channels, and symmetry-collapsed MS channels are
+    recomputed with CORRECTED_ prefixes
+
+For MS-specific channels, every nonzero channel is treated independently.
+Channels with identical |H_SO| values have identical corrected WC
+probabilities and rates, so only one representative curve is retained.
+No MS-specific probabilities, numbers of states, microcanonical rates,
+or canonical rates are summed.
+''')
+
+required_vars_step105 = [
+    "jobname",
+    "total_energy_grid_cm1",
+    "E_MECP",
+    "H_SO_cm",
+    "autocm",
+    "mu_au",
+    "projected_gradient_mean",
+    "gradient_gap_magnitude",
+    "compute_weak_coupling_microcanonical_rate",
+    "effective_WC_probability",
+    "effective_WC_rate",
+    "effective_WC_cumulative_states",
+    "E_rate_WC_cm1",
+    "rho_reactant_cm",
+    "local_base",
+]
+
+for var in required_vars_step105:
+    if var not in globals():
+        raise RuntimeError(f"{var} is missing. Run Steps 8–10 first.")
+
+RUN_MODE = globals().get("RUN_MODE", "LOCAL")
+workflow_mode = globals().get("workflow_mode", "MECP_ONLY")
+
+
+def section(title):
+    print("\n" + "=" * 72)
+    print(f" {title}")
+    print("=" * 72 + "\n")
+
+
+def write_local_text(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+
+def save_current_figure(path):
+    plt.tight_layout()
+    plt.savefig(path, dpi=300)
+    plt.show()
+
+
+def ms_tex_value(x):
+    x = float(x)
+
+    if abs(x - round(x)) < 1.0e-8:
+        return str(int(round(x)))
+
+    if abs(abs(x) - 0.5) < 1.0e-8:
+        return r"\frac{1}{2}" if x > 0 else r"-\frac{1}{2}"
+
+    if abs(abs(x) - 1.5) < 1.0e-8:
+        return r"\frac{3}{2}" if x > 0 else r"-\frac{3}{2}"
+
+    if abs(abs(x) - 2.5) < 1.0e-8:
+        return r"\frac{5}{2}" if x > 0 else r"-\frac{5}{2}"
+
+    if abs(abs(x) - 3.5) < 1.0e-8:
+        return r"\frac{7}{2}" if x > 0 else r"-\frac{7}{2}"
+
+    return f"{x:.1f}"
+
+
+def make_corrected_group_legend(prefix, group_data):
+    """
+    Build a legend for one representative threshold-corrected MS-specific curve.
+
+    Multiple symbols indicate channels with identical |H_SO| values and
+    therefore identical corrected probabilities and rates. Commas indicate
+    coincident curves; no summation is implied.
+    """
+    symbols = group_data.get("channel_symbols", [])
+    H_abs = float(group_data["H_abs_cm1"])
+
+    rate_symbols = [sym.replace("$P", "$k") for sym in symbols]
+
+    if len(rate_symbols) == 0:
+        return rf"{prefix} MS ($|H_{{\mathrm{{SO}}}}|$={H_abs:.1f})"
+
+    if len(rate_symbols) <= 3:
+        return (
+            f"{prefix} "
+            + ", ".join(rate_symbols)
+            + rf" ($|H_{{\mathrm{{SO}}}}|$={H_abs:.1f})"
+        )
+
+    return (
+        f"{prefix} "
+        + ", ".join(rate_symbols[:3])
+        + rf", ... ($|H_{{\mathrm{{SO}}}}|$={H_abs:.1f}), "
+        + f"equivalent channels={len(rate_symbols)}"
+    )
+
+
+section("RAW WC PROBABILITY CHECK")
+
+total_energy_grid_cm1 = np.asarray(total_energy_grid_cm1, dtype=float).reshape(-1)
+E_rate_WC_cm1 = np.asarray(E_rate_WC_cm1, dtype=float).reshape(-1)
+rho_reactant_cm = np.asarray(rho_reactant_cm, dtype=float).reshape(-1)
+
+
+def compute_raw_weak_coupling_probability(
+    coupling_cm1,
+    energy_grid_cm1
+):
+    energy_grid_cm1 = np.asarray(
+        energy_grid_cm1,
+        dtype=float
+    ).reshape(-1)
+
+    coupling_Eh = float(abs(coupling_cm1)) / float(autocm)
+    excess_energy_Eh = (
+        energy_grid_cm1 - float(E_MECP)
+    ) / float(autocm)
+
+    raw_probability = np.zeros_like(energy_grid_cm1, dtype=float)
+    airy_argument = np.full_like(
+        energy_grid_cm1,
+        np.nan,
+        dtype=float
+    )
+    airy_value = np.full_like(
+        energy_grid_cm1,
+        np.nan,
+        dtype=float
+    )
+
+    valid = (
+        np.isfinite(energy_grid_cm1)
+        & np.isfinite(excess_energy_Eh)
+    )
+
+    prefactor = (
+        4.0
+        * np.pi**2
+        * coupling_Eh**2
+        * (
+            2.0 * float(mu_au)
+            / (
+                float(projected_gradient_mean)
+                * float(gradient_gap_magnitude)
+            )
+        ) ** (2.0 / 3.0)
+    )
+
+    scale = (
+        2.0
+        * float(mu_au)
+        * float(gradient_gap_magnitude)**2
+        / float(projected_gradient_mean)**4
+    ) ** (1.0 / 3.0)
+
+    airy_argument[valid] = -excess_energy_Eh[valid] * scale
+    airy_value[valid] = airy(airy_argument[valid])[0]
+
+    raw_probability[valid] = (
+        prefactor * airy_value[valid] ** 2
+    )
+    raw_probability[~np.isfinite(raw_probability)] = 0.0
+
+    return raw_probability, airy_argument, airy_value
+
+
+def apply_probability_threshold_truncation(
+    raw_probability,
+    energy_grid_cm1,
+    threshold=1.0
+):
+    raw_probability = np.asarray(
+        raw_probability,
+        dtype=float
+    ).reshape(-1)
+
+    energy_grid_cm1 = np.asarray(
+        energy_grid_cm1,
+        dtype=float
+    ).reshape(-1)
+
+    if raw_probability.size != energy_grid_cm1.size:
+        raise RuntimeError(
+            "raw_probability and energy_grid_cm1 must have the same length."
+        )
+
+    corrected_probability = raw_probability.copy()
+    threshold_indices = np.flatnonzero(
+        raw_probability >= float(threshold)
+    )
+
+    correction_needed = threshold_indices.size > 0
+    first_bad_index = None
+    first_bad_energy = None
+    first_bad_value = None
+
+    if correction_needed:
+        first_bad_index = int(threshold_indices[0])
+        first_bad_energy = float(
+            energy_grid_cm1[first_bad_index]
+        )
+        first_bad_value = float(
+            raw_probability[first_bad_index]
+        )
+        corrected_probability[first_bad_index:] = 0.0
+
+    corrected_probability[
+        ~np.isfinite(corrected_probability)
+    ] = 0.0
+    corrected_probability = np.clip(
+        corrected_probability,
+        0.0,
+        1.0
+    )
+
+    return {
+        "corrected_probability": corrected_probability,
+        "correction_needed": correction_needed,
+        "first_bad_index": first_bad_index,
+        "first_bad_energy": first_bad_energy,
+        "first_bad_value": first_bad_value,
+        "threshold": float(threshold),
+    }
+
+
+P_WC_raw_effective, airy_arg_WC_raw_effective, Ai_WC_raw_effective = (
+    compute_raw_weak_coupling_probability(H_SO_cm, total_energy_grid_cm1)
+)
+
+effective_correction_result = apply_probability_threshold_truncation(
+    P_WC_raw_effective,
+    total_energy_grid_cm1,
+    threshold=1.0
+)
+
+WC_threshold_correction_needed = effective_correction_result["correction_needed"]
+WC_threshold_first_bad_index = effective_correction_result["first_bad_index"]
+WC_threshold_first_bad_energy = effective_correction_result["first_bad_energy"]
+WC_threshold_first_bad_value = effective_correction_result["first_bad_value"]
+
+globals().update({
+    "compute_raw_weak_coupling_probability": compute_raw_weak_coupling_probability,
+    "apply_probability_threshold_truncation": apply_probability_threshold_truncation,
+    "WC_threshold_correction_needed": WC_threshold_correction_needed,
+    "WC_threshold_first_bad_index": WC_threshold_first_bad_index,
+    "WC_threshold_first_bad_energy": WC_threshold_first_bad_energy,
+    "WC_threshold_first_bad_value": WC_threshold_first_bad_value,
+})
+
+if not WC_threshold_correction_needed:
+
+    print("Raw WC probability never reached 1.")
+    print("threshold-corrected WC correction is NOT needed.")
+    print("No CORRECTED-prefixed variables were created.")
+    print("No WC recomputation, plotting, saving, or uploading was performed.")
+    print(f"Maximum raw P_WC = {np.nanmax(P_WC_raw_effective):.12e}")
+
+    print("\nAvailable diagnostic flags:")
+    print("  WC_threshold_correction_needed")
+    print("  WC_threshold_first_bad_index")
+    print("  WC_threshold_first_bad_energy")
+    print("  WC_threshold_first_bad_value")
+    print("  compute_raw_weak_coupling_probability")
+    print("  apply_probability_threshold_truncation")
+
+    print("\n================ STEP 11 DONE: NO threshold-corrected WC CORRECTION NEEDED =================\n")
+
+else:
+
+    section("STEP 11 DIRECTORY SETUP")
+
+    local_step11 = os.path.join(
+        local_base,
+        "WC_threshold_truncation_correction"
+    )
+    os.makedirs(local_step11, exist_ok=True)
+
+    # Local PC compatibility alias. No remote directory is created.
+    remote_step11 = local_step11
+
+    plot_files_step11 = {}
+
+    def register_plot(name):
+        path = os.path.join(local_step11, f"Step11_{name}.png")
+        plot_files_step11[name] = path
+        return path
+
+    print(f"Local Step 11 directory  : {local_step11}")
+    print(f"remote_step11 local alias: {remote_step11}")
+
+    section("EFFECTIVE WC threshold-corrected CONVENTION")
+
+    print("threshold-truncation rule IS needed for effective WC.")
+    print(f"  First raw P_WC >= 1 index  : {WC_threshold_first_bad_index}")
+    print(f"  First raw P_WC >= 1 energy : {WC_threshold_first_bad_energy:.6f} cm^-1")
+    print(f"  First raw P_WC >= 1 value  : {WC_threshold_first_bad_value:.12e}")
+
+    CORRECTED_P_WC_effective = effective_correction_result["corrected_probability"]
+
+    CORRECTED_N_WC_effective, CORRECTED_k_WC_effective = (
+        compute_weak_coupling_microcanonical_rate(CORRECTED_P_WC_effective)
+    )
+
+    CORRECTED_k_WC_effective_micro_s_inv = CORRECTED_k_WC_effective
+    CORRECTED_rate_WC_effective = CORRECTED_k_WC_effective
+    CORRECTED_states_WC_effective = CORRECTED_N_WC_effective
+
+    print(f"Original clipped max P_WC        : {np.nanmax(effective_WC_probability):.12e}")
+    print(f"Raw unclipped max P_WC          : {np.nanmax(P_WC_raw_effective):.12e}")
+    print(f"threshold-corrected max P_WC                   : {np.nanmax(CORRECTED_P_WC_effective):.12e}")
+    print(f"Original clipped max k_WC        : {np.nanmax(effective_WC_rate):.12e} s^-1")
+    print(f"threshold-corrected max k_WC                   : {np.nanmax(CORRECTED_k_WC_effective):.12e} s^-1")
+
+    section("INTERMEDIATE WC threshold-corrected CONVENTION")
+
+    CORRECTED_P_WC_intermediate = {}
+    CORRECTED_N_WC_intermediate = {}
+    CORRECTED_k_WC_intermediate = {}
+
+    if "k_WC_intermediate" in globals() and len(k_WC_intermediate) > 0:
+        for key, data in k_WC_intermediate.items():
+            H_int = float(data["H_int_cm1"])
+
+            P_raw, airy_arg_raw, Ai_raw = compute_raw_weak_coupling_probability(
+                H_int,
+                total_energy_grid_cm1
+            )
+
+            result = apply_probability_threshold_truncation(P_raw, total_energy_grid_cm1, threshold=1.0)
+            corrected_probability = result["corrected_probability"]
+
+            corrected_states, corrected_rate = compute_weak_coupling_microcanonical_rate(corrected_probability)
+
+            CORRECTED_P_WC_intermediate[key] = {
+                "H_int_cm1": H_int,
+                "abs_Ms_low": float(data["abs_Ms_low"]),
+                "degeneracy": int(data["degeneracy"]),
+                "P_raw": P_raw,
+                "corrected_probability": corrected_probability,
+                "airy_arg_raw": airy_arg_raw,
+                "Ai_raw": Ai_raw,
+                "correction_needed": result["correction_needed"],
+                "first_bad_index": result["first_bad_index"],
+                "first_bad_energy": result["first_bad_energy"],
+                "first_bad_value": result["first_bad_value"],
+            }
+
+            CORRECTED_N_WC_intermediate[key] = corrected_states
+
+            CORRECTED_k_WC_intermediate[key] = {
+                "H_int_cm1": H_int,
+                "abs_Ms_low": float(data["abs_Ms_low"]),
+                "degeneracy": int(data["degeneracy"]),
+                "corrected_states": corrected_states,
+                "corrected_rate": corrected_rate,
+                "corrected_probability": corrected_probability,
+                "P_raw": P_raw,
+                "correction_needed": result["correction_needed"],
+                "first_bad_index": result["first_bad_index"],
+                "first_bad_energy": result["first_bad_energy"],
+                "first_bad_value": result["first_bad_value"],
+            }
+
+        print(f"Intermediate WC curves corrected : {len(CORRECTED_k_WC_intermediate)}")
+
+        for key, data in sorted(
+            CORRECTED_k_WC_intermediate.items(),
+            key=lambda x: x[1]["abs_Ms_low"]
+        ):
+            print(
+                f"  {key:20s} | "
+                f"k^{{{ms_tex_value(data['abs_Ms_low'])}}} | "
+                f"SOC_int={data['H_int_cm1']:.3f} | "
+                f"needed={data['correction_needed']} | "
+                f"first_bad_E={data['first_bad_energy']}"
+            )
+    else:
+        print("No k_WC_intermediate found. Intermediate correction skipped.")
+
+    section("SYMMETRY-COLLAPSED MS-SPECIFIC WC threshold-corrected CONVENTION")
+
+    CORRECTED_P_WC_channel_groups = {}
+    CORRECTED_N_WC_channel_groups = {}
+    CORRECTED_k_WC_channel_groups = {}
+
+    if "k_WC_channel_groups" in globals() and len(k_WC_channel_groups) > 0:
+        for group_key, group_data in k_WC_channel_groups.items():
+            H_abs = float(group_data["H_abs_cm1"])
+            labels = list(group_data.get("labels", []))
+            symbols = list(group_data.get("channel_symbols", []))
+            representative_label = group_data.get("representative_label")
+
+            P_raw, airy_arg_raw, Ai_raw = compute_raw_weak_coupling_probability(
+                H_abs,
+                total_energy_grid_cm1
+            )
+
+            result = apply_probability_threshold_truncation(
+                P_raw,
+                total_energy_grid_cm1,
+                threshold=1.0
+            )
+            corrected_probability = result["corrected_probability"]
+
+            corrected_representative_states, corrected_representative_rate = (
+                compute_weak_coupling_microcanonical_rate(corrected_probability)
+            )
+
+            CORRECTED_P_WC_channel_groups[group_key] = {
+                "H_abs_cm1": H_abs,
+                "degeneracy": int(
+                    group_data.get("degeneracy", len(labels))
+                ),
+                "channel_symbols": symbols,
+                "labels": labels,
+                "representative_label": representative_label,
+                "P_raw": P_raw,
+                "corrected_probability": corrected_probability,
+                "airy_arg_raw": airy_arg_raw,
+                "Ai_raw": Ai_raw,
+                "correction_needed": result["correction_needed"],
+                "first_bad_index": result["first_bad_index"],
+                "first_bad_energy": result["first_bad_energy"],
+                "first_bad_value": result["first_bad_value"],
+                "combination_rule": "representative_only_no_sum",
+            }
+
+            CORRECTED_N_WC_channel_groups[group_key] = (
+                corrected_representative_states
+            )
+
+            CORRECTED_k_WC_channel_groups[group_key] = {
+                "H_abs_cm1": H_abs,
+                "degeneracy": int(
+                    group_data.get("degeneracy", len(labels))
+                ),
+                "channel_symbols": symbols,
+                "labels": labels,
+                "representative_label": representative_label,
+                "corrected_representative_states": corrected_representative_states,
+                "corrected_representative_rate": corrected_representative_rate,
+                "corrected_probability": corrected_probability,
+                "P_raw": P_raw,
+                "correction_needed": result["correction_needed"],
+                "first_bad_index": result["first_bad_index"],
+                "first_bad_energy": result["first_bad_energy"],
+                "first_bad_value": result["first_bad_value"],
+                "combination_rule": "representative_only_no_sum",
+            }
+
+        print(
+            "Representative MS-specific WC curves corrected : "
+            f"{len(CORRECTED_k_WC_channel_groups)}"
+        )
+
+        for key, data in sorted(
+            CORRECTED_k_WC_channel_groups.items(),
+            key=lambda x: x[1]["H_abs_cm1"],
+            reverse=True
+        ):
+            print(
+                f"  {key:16s} | "
+                f"|H|={data['H_abs_cm1']:.3f} | "
+                f"equivalent={data['degeneracy']} | "
+                f"needed={data['correction_needed']} | "
+                f"first_bad_E={data['first_bad_energy']} | "
+                f"representative={data['representative_label']}"
+            )
+    else:
+        print(
+            "No k_WC_channel_groups found. "
+            "Representative MS-specific correction skipped."
+        )
+
+    section("CANONICAL WC threshold-corrected CONVENTION")
+
+    CORRECTED_k_WC_canonical_s_inv = None
+    CORRECTED_WC_canonical_normalization = None
+    CORRECTED_k_WC_intermediate_canonical = {}
+    CORRECTED_k_WC_channel_groups_canonical = {}
+
+    if (
+        "boltzmann_average_microcanonical_rate" in globals()
+        and "T_grid_K" in globals()
+        and "dE_WC" in globals()
+    ):
+        CORRECTED_k_WC_canonical_s_inv, CORRECTED_WC_canonical_normalization = boltzmann_average_microcanonical_rate(
+            E_rate_WC_cm1,
+            rho_reactant_cm,
+            CORRECTED_k_WC_effective[1:],
+            T_grid_K,
+            dE_WC
+        )
+
+        for key, data in CORRECTED_k_WC_intermediate.items():
+            k_T, _ = boltzmann_average_microcanonical_rate(
+                E_rate_WC_cm1,
+                rho_reactant_cm,
+                data["corrected_rate"][1:],
+                T_grid_K,
+                dE_WC
+            )
+
+            CORRECTED_k_WC_intermediate_canonical[key] = {
+                "H_int_cm1": data["H_int_cm1"],
+                "abs_Ms_low": data["abs_Ms_low"],
+                "degeneracy": data["degeneracy"],
+                "k_T": k_T,
+                "correction_needed": data["correction_needed"],
+                "first_bad_energy": data["first_bad_energy"],
+            }
+
+        for key, data in CORRECTED_k_WC_channel_groups.items():
+            k_T, _ = boltzmann_average_microcanonical_rate(
+                E_rate_WC_cm1,
+                rho_reactant_cm,
+                data["corrected_representative_rate"][1:],
+                T_grid_K,
+                dE_WC
+            )
+
+            CORRECTED_k_WC_channel_groups_canonical[key] = {
+                "H_abs_cm1": data["H_abs_cm1"],
+                "degeneracy": data["degeneracy"],
+                "channel_symbols": data["channel_symbols"],
+                "labels": data["labels"],
+                "representative_label": data["representative_label"],
+                "combination_rule": "representative_only_no_sum",
+                "k_T": k_T,
+                "correction_needed": data["correction_needed"],
+                "first_bad_energy": data["first_bad_energy"],
+            }
+
+        print("Canonical threshold-corrected WC correction completed.")
+        print(f"Original clipped WC canonical max : {np.nanmax(k_WC_canonical_s_inv):.12e} s^-1")
+        print(f"threshold-corrected WC canonical max            : {np.nanmax(CORRECTED_k_WC_canonical_s_inv):.12e} s^-1")
+
+    else:
+        print("Step 10 canonical variables not found. Canonical correction skipped.")
+
+    section("SELECTED-ENERGY WC DIAGNOSTIC")
+
+    print(
+        " E/cm^-1     P_WC_raw        P_WC_original_clipped     CORRECTED_P_WC      "
+        "k_WC_original/s^-1     CORRECTED_k_WC/s^-1"
+    )
+    print("-" * 110)
+
+    selected_energies = [3000, 3500, 3560, 3566, 3600, 4000, 5000, 6000, 8000]
+
+    for E_test in selected_energies:
+        idx = int(round(float(E_test) / float(globals().get("energy_step_cm1", 1.0))))
+
+        if 0 <= idx < len(total_energy_grid_cm1):
+            print(
+                f"{total_energy_grid_cm1[idx]:8.3f}  "
+                f"{P_WC_raw_effective[idx]:14.7e}  "
+                f"{effective_WC_probability[idx]:14.7e}  "
+                f"{CORRECTED_P_WC_effective[idx]:14.7e}  "
+                f"{effective_WC_rate[idx]:18.7e}  "
+                f"{CORRECTED_k_WC_effective[idx]:18.7e}"
+            )
+
+    section("SAVING STEP 11 OUTPUTS")
+
+    summary_file_step11 = os.path.join(
+        local_step11,
+        "Step11_CORRECTED_WC_summary.txt"
+    )
+
+    effective_grid_file_step11 = os.path.join(
+        local_step11,
+        "Step11_CORRECTED_WC_effective_grid.txt"
+    )
+
+    intermediate_file_step11 = os.path.join(
+        local_step11,
+        "Step11_CORRECTED_WC_intermediate_summary.txt"
+    )
+
+    channel_file_step11 = os.path.join(
+        local_step11,
+        "Step11_CORRECTED_WC_representative_channel_summary.txt"
+    )
+
+    summary_lines = []
+    summary_lines.append("Step 11 threshold-corrected-convention WC correction")
+    summary_lines.append(f"Run mode = {RUN_MODE}")
+    summary_lines.append(f"Workflow mode = {workflow_mode}")
+    summary_lines.append("")
+    summary_lines.append("[EFFECTIVE]")
+    summary_lines.append(f"H_SO_cm = {float(H_SO_cm):.12f}")
+    summary_lines.append(f"E_MECP = {float(E_MECP):.12f}")
+    summary_lines.append(f"WC_threshold_correction_needed = {WC_threshold_correction_needed}")
+    summary_lines.append(f"WC_threshold_first_bad_index = {WC_threshold_first_bad_index}")
+    summary_lines.append(f"WC_threshold_first_bad_energy = {WC_threshold_first_bad_energy}")
+    summary_lines.append(f"WC_threshold_first_bad_value = {WC_threshold_first_bad_value}")
+    summary_lines.append(f"Original_clipped_P_WC_max = {np.nanmax(effective_WC_probability):.12e}")
+    summary_lines.append(f"Raw_P_WC_max = {np.nanmax(P_WC_raw_effective):.12e}")
+    summary_lines.append(f"CORRECTED_P_WC_max = {np.nanmax(CORRECTED_P_WC_effective):.12e}")
+    summary_lines.append(f"Original_k_WC_max = {np.nanmax(effective_WC_rate):.12e}")
+    summary_lines.append(f"CORRECTED_k_WC_max = {np.nanmax(CORRECTED_k_WC_effective):.12e}")
+    summary_lines.append("")
+    summary_lines.append("[CANONICAL]")
+    if CORRECTED_k_WC_canonical_s_inv is not None:
+        summary_lines.append(f"Original_k_WC_canonical_max = {np.nanmax(k_WC_canonical_s_inv):.12e}")
+        summary_lines.append(f"CORRECTED_k_WC_canonical_max = {np.nanmax(CORRECTED_k_WC_canonical_s_inv):.12e}")
+    else:
+        summary_lines.append("Canonical correction skipped.")
+    summary_lines.append("")
+    summary_lines.append("[COUNTS]")
+    summary_lines.append(f"CORRECTED_intermediate_count = {len(CORRECTED_k_WC_intermediate)}")
+    summary_lines.append(f"CORRECTED_representative_channel_count = {len(CORRECTED_k_WC_channel_groups)}")
+
+    write_local_text(summary_file_step11, "\n".join(summary_lines) + "\n")
+
+    grid_lines = []
+    grid_lines.append(
+        "E_cm1  P_WC_raw  P_WC_original_clipped  CORRECTED_P_WC  "
+        "N_WC_original  CORRECTED_N_WC  k_WC_original_s^-1  CORRECTED_k_WC_s^-1"
+    )
+
+    for i in range(len(total_energy_grid_cm1)):
+        grid_lines.append(
+            f"{total_energy_grid_cm1[i]:18.10f} "
+            f"{P_WC_raw_effective[i]:18.10e} "
+            f"{effective_WC_probability[i]:18.10e} "
+            f"{CORRECTED_P_WC_effective[i]:18.10e} "
+            f"{effective_WC_cumulative_states[i]:18.10e} "
+            f"{CORRECTED_N_WC_effective[i]:18.10e} "
+            f"{effective_WC_rate[i]:18.10e} "
+            f"{CORRECTED_k_WC_effective[i]:18.10e}"
+        )
+
+    write_local_text(effective_grid_file_step11, "\n".join(grid_lines) + "\n")
+
+    intermediate_lines = []
+    intermediate_lines.append("threshold-corrected WC intermediate correction summary")
+    intermediate_lines.append("label  abs_Ms_low  degeneracy  H_int_cm1  needed  first_bad_E  first_bad_value  k_max")
+
+    for key, data in sorted(
+        CORRECTED_k_WC_intermediate.items(),
+        key=lambda x: x[1]["abs_Ms_low"]
+    ):
+        intermediate_lines.append(
+            f"{key:20s} "
+            f"{data['abs_Ms_low']:12.6f} "
+            f"{data['degeneracy']:5d} "
+            f"{data['H_int_cm1']:18.10f} "
+            f"{str(data['correction_needed']):8s} "
+            f"{str(data['first_bad_energy']):18s} "
+            f"{str(data['first_bad_value']):18s} "
+            f"{np.nanmax(data['corrected_rate']):18.10e}"
+        )
+
+    write_local_text(intermediate_file_step11, "\n".join(intermediate_lines) + "\n")
+
+    channel_lines = []
+    channel_lines.append("threshold-corrected WC representative MS-specific correction summary; no summation")
+    channel_lines.append("group_key  H_abs_cm1  equivalent_count  symbols  representative_label  needed  first_bad_E  first_bad_value  k_representative_max")
+
+    for key, data in sorted(
+        CORRECTED_k_WC_channel_groups.items(),
+        key=lambda x: x[1]["H_abs_cm1"],
+        reverse=True
+    ):
+        representative_label_text = format_ms_channel_label_for_text(
+            data.get("representative_label")
+        )
+
+        channel_lines.append(
+            f"{key:16s} "
+            f"{data['H_abs_cm1']:18.10f} "
+            f"{data['degeneracy']:5d} "
+            f"{', '.join(data.get('channel_symbols', [])):35s} "
+            f"{representative_label_text:45s} "
+            f"{str(data['correction_needed']):8s} "
+            f"{str(data['first_bad_energy']):18s} "
+            f"{str(data['first_bad_value']):18s} "
+            f"{np.nanmax(data['corrected_representative_rate']):18.10e}"
+        )
+
+    write_local_text(channel_file_step11, "\n".join(channel_lines) + "\n")
+
+    section("PLOTTING threshold-corrected WC CORRECTION")
+
+    plt.figure(figsize=(8.8, 5.0))
+    plt.plot(total_energy_grid_cm1, effective_WC_probability, linewidth=2.0, label=rf"Clipped $P_{{WC}}^{{eff}}$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})")
+    plt.plot(total_energy_grid_cm1, P_WC_raw_effective, linewidth=1.4, linestyle=":", label=rf"Raw WC unclipped ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})")
+    plt.plot(total_energy_grid_cm1, CORRECTED_P_WC_effective, linewidth=2.0, linestyle="--", label=rf"Threshold-truncated $P_{{WC}}^{{eff}}$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})")
+    plt.axhline(1.0, color="k", linestyle=":", linewidth=1.2, label="$P=1$")
+    plt.axvline(E_MECP, color="k", linestyle="--", linewidth=1.2, label="MECP")
+    plt.axvline(
+        WC_threshold_first_bad_energy,
+        color="k",
+        linestyle="-.",
+        linewidth=1.2,
+        label="First raw $P_{WC}\\geq1$"
+    )
+    plt.xlim(max(0.0, float(E_MECP) - 1500.0), min(np.nanmax(total_energy_grid_cm1), float(E_MECP) + 5000.0))
+    plt.ylim(-0.05, 1.2)
+    plt.xlabel("Total energy relative to reference minimum (cm$^{-1}$)", fontsize=12)
+    plt.ylabel("WC probability", fontsize=12)
+    plt.title("WC Probability: Clipped vs Threshold-Truncated", fontsize=14)
+    plt.tick_params(axis="both", labelsize=12)
+    plt.grid(False)
+    plt.legend()
+    save_current_figure(register_plot("WC_probability_original_vs_threshold_corrected"))
+
+    plt.figure(figsize=(8.8, 5.0))
+    mask_py = effective_WC_rate > 0.0
+    mask_corrected = CORRECTED_k_WC_effective > 0.0
+    plt.plot(
+        total_energy_grid_cm1[mask_py],
+        np.log10(effective_WC_rate[mask_py]),
+        linewidth=2.0,
+        label=rf"Clipped $k_{{WC}}^{{eff}}(E)$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+    )
+    plt.plot(
+        total_energy_grid_cm1[mask_corrected],
+        np.log10(CORRECTED_k_WC_effective[mask_corrected]),
+        linewidth=2.0,
+        linestyle="--",
+        label=rf"Threshold-truncated $k_{{WC}}^{{eff}}(E)$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+    )
+    plt.axvline(E_MECP, color="k", linestyle="--", linewidth=1.2, label="MECP")
+    plt.axvline(
+        WC_threshold_first_bad_energy,
+        color="k",
+        linestyle="-.",
+        linewidth=1.2,
+        label="First raw $P_{WC}\\geq1$"
+    )
+    plt.xlabel("Total energy relative to reference minimum (cm$^{-1}$)", fontsize=12)
+    plt.ylabel(r"$\log_{10}[k_{\mathrm{WC}}^{eff}(E)/\mathrm{s}^{-1}]$", fontsize=12)
+    plt.title("Log-scale WC Microcanonical Rate: Clipped vs Threshold-Truncated", fontsize=14)
+    plt.tick_params(axis="both", labelsize=12)
+    plt.grid(False)
+    plt.legend()
+    save_current_figure(register_plot("WC_microcanonical_rate_original_vs_threshold_corrected"))
+
+    # Regular-scale WC microcanonical-rate comparison
+    plt.figure(figsize=(8.8, 5.0))
+    plt.plot(
+        total_energy_grid_cm1,
+        effective_WC_rate,
+        linewidth=2.0,
+        label=rf"Clipped $k_{{WC}}^{{eff}}(E)$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+    )
+    plt.plot(
+        total_energy_grid_cm1,
+        CORRECTED_k_WC_effective,
+        linewidth=2.0,
+        linestyle="--",
+        label=rf"Threshold-truncated $k_{{WC}}^{{eff}}(E)$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+    )
+    plt.axvline(E_MECP, color="k", linestyle="--", linewidth=1.2, label="MECP")
+    plt.axvline(
+        WC_threshold_first_bad_energy,
+        color="k",
+        linestyle="-.",
+        linewidth=1.2,
+        label="First raw $P_{WC}\\geq1$"
+    )
+    plt.xlabel("Total energy relative to reference minimum (cm$^{-1}$)", fontsize=12)
+    plt.ylabel(r"$k_{\mathrm{WC}}^{eff}(E)$ (s$^{-1}$)", fontsize=12)
+    plt.title("WC Microcanonical Rate: Clipped vs Threshold-Truncated", fontsize=14)
+    plt.tick_params(axis="both", labelsize=12)
+    plt.grid(False)
+    plt.legend()
+    save_current_figure(register_plot("WC_microcanonical_rate_linear_clipped_vs_threshold_truncated"))
+
+    if CORRECTED_k_WC_canonical_s_inv is not None:
+        plt.figure(figsize=(8.8, 5.0))
+        plt.plot(
+            T_grid_K,
+            k_WC_canonical_s_inv,
+            linewidth=2.0,
+            label=rf"Clipped $k_{{WC}}^{{eff}}(T)$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+        )
+        plt.plot(
+            T_grid_K,
+            CORRECTED_k_WC_canonical_s_inv,
+            linewidth=2.0,
+            linestyle="--",
+            label=rf"Threshold-truncated $k_{{WC}}^{{eff}}(T)$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+        )
+        plt.xlabel("Temperature (K)", fontsize=12)
+        plt.ylabel(r"$k_{\mathrm{WC}}^{eff}(T)$ (s$^{-1}$)", fontsize=12)
+        plt.title("WC Canonical Rate: Clipped vs Threshold-Truncated", fontsize=14)
+        plt.tick_params(axis="both", labelsize=12)
+        plt.grid(False)
+        plt.legend()
+        save_current_figure(register_plot("WC_canonical_rate_original_vs_threshold_corrected"))
+
+        plt.figure(figsize=(8.8, 5.0))
+        mask_py_T = k_WC_canonical_s_inv > 0.0
+        mask_corrected_T = CORRECTED_k_WC_canonical_s_inv > 0.0
+        plt.plot(
+            1000.0 / T_grid_K[mask_py_T],
+            np.log10(k_WC_canonical_s_inv[mask_py_T]),
+            linewidth=2.0,
+            label=rf"Clipped $k_{{WC}}^{{eff}}(T)$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+        )
+        plt.plot(
+            1000.0 / T_grid_K[mask_corrected_T],
+            np.log10(CORRECTED_k_WC_canonical_s_inv[mask_corrected_T]),
+            linewidth=2.0,
+            linestyle="--",
+            label=rf"Threshold-truncated $k_{{WC}}^{{eff}}(T)$ ($H_{{\mathrm{{SO}}}}^{{eff}}$={H_SO_cm:.1f})"
+        )
+        plt.xlabel(r"$1000/T$ (K$^{-1}$)", fontsize=12)
+        plt.ylabel(r"$\log_{10}[k_{\mathrm{WC}}^{eff}(T)/\mathrm{s}^{-1}]$", fontsize=12)
+        plt.title("Log-scale WC Canonical Rate: Clipped vs Threshold-Truncated", fontsize=14)
+        plt.tick_params(axis="both", labelsize=12)
+        plt.grid(False)
+        plt.legend()
+        save_current_figure(register_plot("WC_canonical_log_scale_clipped_vs_threshold_truncated"))
+
+    remote_summary_file_step11 = summary_file_step11
+    remote_effective_grid_file_step11 = effective_grid_file_step11
+    remote_intermediate_file_step11 = intermediate_file_step11
+    remote_channel_file_step11 = channel_file_step11
+    remote_plot_files_step11 = dict(plot_files_step11)
+
+    print(f"Local Step 11 summary              : {summary_file_step11}")
+    print(
+        f"Local corrected effective grid     : "
+        f"{effective_grid_file_step11}"
+    )
+    print(
+        f"Local intermediate summary         : "
+        f"{intermediate_file_step11}"
+    )
+    print(
+        f"Local representative-channel file  : "
+        f"{channel_file_step11}"
+    )
+
+    for name, path in plot_files_step11.items():
+        print(f"Local plot {name:40s}: {path}")
+
+    print(f"remote_step11 local alias          : {remote_step11}")
+    print(
+        f"Step 11 summary alias              : "
+        f"{remote_summary_file_step11}"
+    )
+    print(
+        f"Corrected-grid alias               : "
+        f"{remote_effective_grid_file_step11}"
+    )
+    print(
+        f"Intermediate-summary alias         : "
+        f"{remote_intermediate_file_step11}"
+    )
+    print(
+        f"Representative-channel alias       : "
+        f"{remote_channel_file_step11}"
+    )
+
+    globals().update({
+        "P_WC_raw_effective": P_WC_raw_effective,
+        "airy_arg_WC_raw_effective": airy_arg_WC_raw_effective,
+        "Ai_WC_raw_effective": Ai_WC_raw_effective,
+
+        "CORRECTED_P_WC_effective": CORRECTED_P_WC_effective,
+        "CORRECTED_N_WC_effective": CORRECTED_N_WC_effective,
+        "CORRECTED_k_WC_effective": CORRECTED_k_WC_effective,
+        "CORRECTED_k_WC_effective_micro_s_inv": CORRECTED_k_WC_effective_micro_s_inv,
+        "CORRECTED_rate_WC_effective": CORRECTED_rate_WC_effective,
+        "CORRECTED_states_WC_effective": CORRECTED_states_WC_effective,
+
+        "CORRECTED_P_WC_intermediate": CORRECTED_P_WC_intermediate,
+        "CORRECTED_N_WC_intermediate": CORRECTED_N_WC_intermediate,
+        "CORRECTED_k_WC_intermediate": CORRECTED_k_WC_intermediate,
+
+        "CORRECTED_P_WC_channel_groups": CORRECTED_P_WC_channel_groups,
+        "CORRECTED_N_WC_channel_groups": CORRECTED_N_WC_channel_groups,
+        "CORRECTED_k_WC_channel_groups": CORRECTED_k_WC_channel_groups,
+
+        "CORRECTED_k_WC_canonical_s_inv": CORRECTED_k_WC_canonical_s_inv,
+        "CORRECTED_WC_canonical_normalization": CORRECTED_WC_canonical_normalization,
+        "CORRECTED_k_WC_intermediate_canonical": CORRECTED_k_WC_intermediate_canonical,
+        "CORRECTED_k_WC_channel_groups_canonical": CORRECTED_k_WC_channel_groups_canonical,
+
+        "local_step11": local_step11,
+        "remote_step11": remote_step11,
+        "plot_files_step11": plot_files_step11,
+        "summary_file_step11": summary_file_step11,
+        "effective_grid_file_step11": effective_grid_file_step11,
+        "intermediate_file_step11": intermediate_file_step11,
+        "channel_file_step11": channel_file_step11,
+        "remote_summary_file_step11": remote_summary_file_step11,
+        "remote_effective_grid_file_step11": remote_effective_grid_file_step11,
+        "remote_intermediate_file_step11": remote_intermediate_file_step11,
+        "remote_channel_file_step11": remote_channel_file_step11,
+        "remote_plot_files_step11": remote_plot_files_step11,
+    })
+
+    section("STEP 11 SUMMARY")
+
+    print(f"threshold-corrected WC correction needed       : {WC_threshold_correction_needed}")
+    print(f"First raw P_WC >= 1 energy      : {WC_threshold_first_bad_energy}")
+    print(f"Python max WC micro rate        : {np.nanmax(effective_WC_rate):.6e} s^-1")
+    print(f"threshold-corrected max WC micro rate          : {np.nanmax(CORRECTED_k_WC_effective):.6e} s^-1")
+
+    if CORRECTED_k_WC_canonical_s_inv is not None:
+        print(f"Python max WC canonical rate    : {np.nanmax(k_WC_canonical_s_inv):.6e} s^-1")
+        print(f"threshold-corrected max WC canonical rate      : {np.nanmax(CORRECTED_k_WC_canonical_s_inv):.6e} s^-1")
+
+    print("\nImportant new variables:")
+    print("  CORRECTED_P_WC_effective")
+    print("  CORRECTED_k_WC_effective_micro_s_inv")
+    print("  CORRECTED_k_WC_canonical_s_inv")
+    print("  CORRECTED_k_WC_intermediate")
+    print("  CORRECTED_k_WC_channel_groups")
+    print("  WC_threshold_correction_needed")
+    print("  WC_threshold_first_bad_energy")
+
+    print("\nSTEP 11 COMPLETED SUCCESSFULLY.\n")
+    
+#%% STEP 12. Local PC FINAL RESULTS REPORTING + OPTIONAL NAST INTEROPERABILITY EXPORT
+
+import os
+import numpy as np
+
+print("\n================ STEP 12: FINAL RESULTS REPORTING, DIAGNOSTICS, AND EXPORT =================\n")
+
+# ============================================================
+# 12A. Helper functions
+# ============================================================
+
+hartree_to_cm = float(globals().get("hartree_to_cm", 219474.6313705))
+hartree_to_kjmol = 2625.499638
+cm_to_kjmol = 0.01196266
+
+def section(title):
+    line = "\n" + "=" * 72 + f"\n {title}\n" + "=" * 72 + "\n"
+    print(line)
+    return line
+
+def fmt_scalar(x, digits=12):
+    try:
+        if x is None:
+            return "None"
+        x = float(x)
+        if not np.isfinite(x):
+            return "nan"
+        return f"{x:.{digits}g}"
+    except Exception:
+        return str(x)
+
+def as_array_or_none(*names):
+    for name in names:
+        if name in globals():
+            arr = np.asarray(globals()[name], dtype=float).reshape(-1)
+            if arr.size > 0:
+                return arr, name
+    return None, None
+
+def scalar_or_none(*names):
+    for name in names:
+        if name in globals():
+            try:
+                return float(globals()[name]), name
+            except Exception:
+                pass
+    return None, None
+
+def energy_block(label, value_Eh):
+    if value_Eh is None or not np.isfinite(value_Eh):
+        return [
+            f"{label}_hartree = nan",
+            f"{label}_cm1 = nan",
+            f"{label}_kJmol = nan",
+        ]
+    return [
+        f"{label}_hartree = {value_Eh:.15f}",
+        f"{label}_cm1 = {value_Eh * hartree_to_cm:.8f}",
+        f"{label}_kJmol = {value_Eh * hartree_to_kjmol:.8f}",
+    ]
+
+def format_namelist_array(name, values, per_line=10):
+    values = np.asarray(values, dtype=float).reshape(-1)
+    chunks = []
+    for i in range(0, len(values), per_line):
+        chunk = ", ".join(f"{x:.8g}" for x in values[i:i+per_line])
+        if i == 0:
+            chunks.append(f"{name} = {chunk}" + ("," if i + per_line < len(values) else ""))
+        else:
+            chunks.append(f"       {chunk}" + ("," if i + per_line < len(values) else ""))
+    return "\n".join(chunks)
+
+def write_text(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+
+def print_and_store(lines, text=""):
+    print(text)
+    lines.append(str(text))
+
+# ============================================================
+# 12B. Choose active WC variables
+# ============================================================
+
+use_threshold_corrected_WC = (
+    "WC_threshold_correction_needed" in globals()
+    and WC_threshold_correction_needed is True
+    and "CORRECTED_P_WC_effective" in globals()
+    and "CORRECTED_k_WC_effective_micro_s_inv" in globals()
+    and "CORRECTED_N_WC_effective" in globals()
+)
+
+if use_threshold_corrected_WC:
+    active_probWC = np.asarray(
+        CORRECTED_P_WC_effective,
+        dtype=float
+    ).reshape(-1)
+    active_rateWC = np.asarray(
+        CORRECTED_k_WC_effective_micro_s_inv,
+        dtype=float
+    ).reshape(-1)
+    active_nosWC = np.asarray(
+        CORRECTED_N_WC_effective,
+        dtype=float
+    ).reshape(-1)
+    active_WC_label = "Threshold-corrected WC"
+else:
+    active_probWC = np.asarray(
+        effective_WC_probability,
+        dtype=float
+    ).reshape(-1)
+    active_rateWC = np.asarray(
+        effective_WC_rate,
+        dtype=float
+    ).reshape(-1)
+    active_nosWC = np.asarray(
+        effective_WC_cumulative_states,
+        dtype=float
+    ).reshape(-1)
+    active_WC_label = "Original clipped WC"
+
+step12_console_lines = []
+debug_records = []
+
+print_and_store(step12_console_lines, f"WC source: {active_WC_label}")
+
+# ============================================================
+# 12C. Canonical rates
+# ============================================================
+
+required_canonical_vars = [
+    "T_grid_K",
+    "k_LZ_canonical_s_inv",
+    "k_WC_canonical_s_inv",
+]
+
+missing_canonical = [v for v in required_canonical_vars if v not in globals()]
+
+if missing_canonical:
+    print_and_store(step12_console_lines, "\nWARNING: Canonical Step 10 variables not found.")
+    print_and_store(step12_console_lines, f"Missing: {missing_canonical}")
+    active_k_WC_canonical = None
+
+else:
+    if (
+        use_threshold_corrected_WC
+        and "CORRECTED_k_WC_canonical_s_inv" in globals()
+    ):
+        active_k_WC_canonical = CORRECTED_k_WC_canonical_s_inv
+    else:
+        active_k_WC_canonical = k_WC_canonical_s_inv
+
+    print_and_store(step12_console_lines, "\n================ CANONICAL RATE CONSTANTS ================\n")
+    print_and_store(step12_console_lines, f"WC canonical source: {active_WC_label}\n")
+
+    header = " T/K        1000/T        k_LZ(T) / s^-1        log10[k_LZ]        k_WC(T) / s^-1        log10[k_WC]"
+    print_and_store(step12_console_lines, header)
+    print_and_store(step12_console_lines, "-" * 105)
+
+    for T, k_lz, k_wc in zip(T_grid_K, k_LZ_canonical_s_inv, active_k_WC_canonical):
+        log_lz = np.log10(k_lz) if k_lz > 0 else np.nan
+        log_wc = np.log10(k_wc) if k_wc > 0 else np.nan
+
+        line = (
+            f"{T:8.2f}  "
+            f"{1000.0/T:10.6f}  "
+            f"{k_lz:18.10e}  "
+            f"{log_lz:14.8f}  "
+            f"{k_wc:18.10e}  "
+            f"{log_wc:14.8f}"
+        )
+        print_and_store(step12_console_lines, line)
+
+# ============================================================
+# 12D. Interactive microcanonical diagnostic
+# ============================================================
+
+required_micro_vars = [
+    "total_energy_grid_cm1",
+    "energy_step_cm1",
+    "crossing_energy_bin_index",
+    "E_MECP",
+    "reactant_state_density",
+    "crossing_shifted_state_density",
+    "crossing_internal_state_density",
+    "effective_LZ_probability",
+    "effective_LZ_cumulative_states",
+    "effective_LZ_rate",
+]
+
+missing_micro = [
+    name
+    for name in required_micro_vars
+    if name not in globals()
+]
+
+if missing_micro:
+    raise RuntimeError(
+        f"Missing microcanonical variables: {missing_micro}"
+    )
+
+total_energy_grid_cm1 = np.asarray(
+    total_energy_grid_cm1,
+    dtype=float
+).reshape(-1)
+
+reactant_state_density = np.asarray(
+    reactant_state_density,
+    dtype=float
+).reshape(-1)
+
+crossing_shifted_state_density = np.asarray(
+    crossing_shifted_state_density,
+    dtype=float
+).reshape(-1)
+
+crossing_internal_state_density = np.asarray(
+    crossing_internal_state_density,
+    dtype=float
+).reshape(-1)
+
+effective_LZ_probability = np.asarray(
+    effective_LZ_probability,
+    dtype=float
+).reshape(-1)
+
+effective_LZ_cumulative_states = np.asarray(
+    effective_LZ_cumulative_states,
+    dtype=float
+).reshape(-1)
+
+effective_LZ_rate = np.asarray(
+    effective_LZ_rate,
+    dtype=float
+).reshape(-1)
+
+energy_step_cm1 = float(energy_step_cm1)
+crossing_energy_bin_index = int(crossing_energy_bin_index)
+
+expected_grid_size = total_energy_grid_cm1.size
+
+diagnostic_arrays = {
+    "reactant_state_density": reactant_state_density,
+    "crossing_shifted_state_density": crossing_shifted_state_density,
+    "effective_LZ_probability": effective_LZ_probability,
+    "effective_LZ_cumulative_states": effective_LZ_cumulative_states,
+    "effective_LZ_rate": effective_LZ_rate,
+    "active_probWC": active_probWC,
+    "active_nosWC": active_nosWC,
+    "active_rateWC": active_rateWC,
+}
+
+for name, array in diagnostic_arrays.items():
+    if array.size != expected_grid_size:
+        raise RuntimeError(
+            f"{name} has length {array.size}; "
+            f"expected {expected_grid_size}."
+        )
+
+print_and_store(
+    step12_console_lines,
+    "\n================ INTERACTIVE MICROCANONICAL DIAGNOSTIC ================\n"
+)
+print(
+    f"Active MECP barrier          : "
+    f"{VaG_MECP_cm1:.6f} cm^-1\n"
+)
+print_and_store(
+    step12_console_lines,
+    "Enter an energy in cm^-1 to print LZ/WC probabilities and rates."
+)
+print_and_store(
+    step12_console_lines,
+    "Type 'stop' to finish.\n"
+)
+
+while True:
+    answer = input(
+        "Energy in cm^-1, or 'stop': "
+    ).strip()
+
+    if answer.lower() in {
+        "stop", "s", "q", "quit", "exit"
+    }:
+        print_and_store(
+            step12_console_lines,
+            "\nInteractive diagnostic stopped."
+        )
+        break
+
+    try:
+        requested_energy_cm1 = float(answer)
+    except ValueError:
+        print("Please enter a valid number or 'stop'.")
+        continue
+
+    energy_index = int(
+        round(requested_energy_cm1 / energy_step_cm1)
+    )
+
+    if (
+        energy_index < 0
+        or energy_index >= expected_grid_size
+    ):
+        print(
+            "Energy is outside the grid. Allowed range: "
+            f"{total_energy_grid_cm1[0]:.3f} to "
+            f"{total_energy_grid_cm1[-1]:.3f} cm^-1."
+        )
+        continue
+
+    internal_crossing_index = (
+        energy_index - crossing_energy_bin_index
+    )
+
+    if (
+        internal_crossing_index > 0
+        and internal_crossing_index
+        < crossing_internal_state_density.size
+    ):
+        crossing_internal_density_value = float(
+            crossing_internal_state_density[
+                internal_crossing_index
+            ]
+        )
+    else:
+        crossing_internal_density_value = np.nan
+
+    record = {
+        "requested_energy_cm1":
+            requested_energy_cm1,
+        "grid_energy_cm1":
+            float(total_energy_grid_cm1[energy_index]),
+        "energy_index":
+            int(energy_index),
+        "crossing_energy_bin_index":
+            crossing_energy_bin_index,
+        "E_MECP_cm1":
+            float(E_MECP),
+        "WC_source":
+            active_WC_label,
+        "reactant_state_density":
+            float(reactant_state_density[energy_index]),
+        "crossing_shifted_state_density":
+            float(
+                crossing_shifted_state_density[
+                    energy_index
+                ]
+            ),
+        "crossing_internal_state_density":
+            crossing_internal_density_value,
+        "P_LZ":
+            float(effective_LZ_probability[energy_index]),
+        "P_WC":
+            float(active_probWC[energy_index]),
+        "N_LZ":
+            float(
+                effective_LZ_cumulative_states[
+                    energy_index
+                ]
+            ),
+        "N_WC":
+            float(active_nosWC[energy_index]),
+        "k_LZ_s_inv":
+            float(effective_LZ_rate[energy_index]),
+        "k_WC_s_inv":
+            float(active_rateWC[energy_index]),
+        "log10_k_LZ":
+            float(
+                np.log10(effective_LZ_rate[energy_index])
+            )
+            if effective_LZ_rate[energy_index] > 0.0
+            else np.nan,
+        "log10_k_WC":
+            float(np.log10(active_rateWC[energy_index]))
+            if active_rateWC[energy_index] > 0.0
+            else np.nan,
+    }
+
+    if (
+        use_threshold_corrected_WC
+        and "P_WC_raw_effective" in globals()
+    ):
+        raw_wc = np.asarray(
+            P_WC_raw_effective,
+            dtype=float
+        ).reshape(-1)
+
+        if raw_wc.size == expected_grid_size:
+            record["P_WC_raw"] = float(
+                raw_wc[energy_index]
+            )
+
+    debug_records.append(record)
+
+    diagnostic_lines = [
+        (
+            "\n================ MICROCANONICAL COMPARISON AT "
+            f"{record['grid_energy_cm1']:.3f} cm^-1 "
+            "================"
+        ),
+        (
+            f"Grid energy                        = "
+            f"{record['grid_energy_cm1']:.3f} cm^-1"
+        ),
+        (
+            f"Requested energy                   = "
+            f"{record['requested_energy_cm1']:.3f} cm^-1"
+        ),
+        (
+            f"Energy index                       = "
+            f"{record['energy_index']}"
+        ),
+        (
+            f"Crossing-energy bin index          = "
+            f"{record['crossing_energy_bin_index']}"
+        ),
+        (
+            f"MECP                               = "
+            f"{record['E_MECP_cm1']:.6f} cm^-1"
+        ),
+        (
+            f"WC source                          = "
+            f"{record['WC_source']}"
+        ),
+        "",
+        "Density of states:",
+        (
+            f"Reactant state density             = "
+            f"{record['reactant_state_density']:.15e}"
+        ),
+        (
+            f"Shifted crossing state density     = "
+            f"{record['crossing_shifted_state_density']:.15e}"
+        ),
+        (
+            f"Internal crossing state density    = "
+            f"{record['crossing_internal_state_density']:.15e}"
+        ),
+        "",
+        "Effective probabilities:",
+        (
+            f"P_LZ                               = "
+            f"{record['P_LZ']:.15e}"
+        ),
+        (
+            f"P_WC                               = "
+            f"{record['P_WC']:.15e}"
+        ),
+    ]
+
+    if "P_WC_raw" in record:
+        diagnostic_lines.append(
+            f"P_WC_raw                           = "
+            f"{record['P_WC_raw']:.15e}"
+        )
+
+    diagnostic_lines.extend([
+        "",
+        "Effective cumulative states:",
+        (
+            f"N_LZ                               = "
+            f"{record['N_LZ']:.15e}"
+        ),
+        (
+            f"N_WC                               = "
+            f"{record['N_WC']:.15e}"
+        ),
+        "",
+        "Microcanonical rates:",
+        (
+            f"k_LZ                               = "
+            f"{record['k_LZ_s_inv']:.15e} s^-1"
+        ),
+        (
+            f"k_WC                               = "
+            f"{record['k_WC_s_inv']:.15e} s^-1"
+        ),
+        (
+            f"log10(k_LZ)                        = "
+            f"{record['log10_k_LZ']:.9f}"
+        ),
+        (
+            f"log10(k_WC)                        = "
+            f"{record['log10_k_WC']:.9f}"
+        ),
+        "",
+    ])
+
+    for line in diagnostic_lines:
+        print_and_store(step12_console_lines, line)
+
+# ============================================================
+# 12E. Final output directory
+# ============================================================
+
+final_output_dir = os.path.join(
+    local_base,
+    "final_output_and_interoperability_exports"
+)
+os.makedirs(final_output_dir, exist_ok=True)
+
+# Local PC compatibility alias. No remote directory is created.
+remote_final_output_dir = final_output_dir
+
+# ============================================================
+# 12F. Gather final physical quantities
+# ============================================================
+
+reference_frequencies, reference_frequencies_source = (
+    as_array_or_none(
+        "reference_vibrational_frequencies_cm1",
+        "freq_reactant_real_cm1"
+    )
+)
+
+crossing_frequencies, crossing_frequencies_source = (
+    as_array_or_none(
+        "freq_MECP_effhess_real_cm1",
+        "freq_MECP_eff_real_cm1"
+    )
+)
+
+reference_inertias, reference_inertias_source = (
+    as_array_or_none(
+        "reference_principal_inertias",
+        "Reference_moments_of_inertia_amu_bohr2"
+    )
+)
+
+crossing_inertias, crossing_inertias_source = (
+    as_array_or_none(
+        "crossing_principal_inertias",
+        "MECP_moments_of_inertia_amu_bohr2"
+    )
+)
+
+redmass, redmass_source = scalar_or_none(
+    "reduced_mass_amu"
+)
+
+soc_eff, soc_source = scalar_or_none(
+    "H_SO_cm"
+)
+
+gradient_gap, gradient_gap_source = scalar_or_none(
+    "GRADIENT_GAP_NORM_EH_PER_BOHR",
+    "gradient_gap_magnitude"
+)
+
+projected_gradient_mean_value, projected_gradient_mean_source = (
+    scalar_or_none(
+        "PROJECTED_GRADIENT_MEAN_EH_PER_BOHR",
+        "projected_gradient_mean_Eh_per_Bohr",
+        "projected_gradient_mean"
+    )
+)
+
+Ele_R_abs_Eh, Ele_R_source = scalar_or_none(
+    "Ele_REF_hartree",
+    "E_ref_hartree"
+)
+
+Ele_X_abs_Eh, Ele_X_source = scalar_or_none(
+    "Ele_MECP_hartree"
+)
+
+Ele_barrier_Eh, Ele_barrier_source = scalar_or_none(
+    "E_MECP_electronic_hartree"
+)
+
+if (
+    Ele_barrier_Eh is None
+    and Ele_R_abs_Eh is not None
+    and Ele_X_abs_Eh is not None
+):
+    Ele_barrier_Eh = Ele_X_abs_Eh - Ele_R_abs_Eh
+    Ele_barrier_source = (
+        "Ele_MECP_hartree - Ele_REF_hartree"
+    )
+
+ZPE_R_Eh, ZPE_R_source = scalar_or_none(
+    "ZPE_REF_freq_hartree",
+    "ZPE_REF_from_freq_hartree",
+    "ZPE_REF_hartree",
+    "ZPE_REF_thermo_hartree"
+)
+
+ZPE_X_Eh, ZPE_X_source = scalar_or_none(
+    "ZPE_MECP_effhess_hartree",
+    "ZPE_X_hartree",
+    "ZPE_MECP_hartree",
+    "ZPE_MECP_from_freq_hartree"
+)
+
+if (
+    ZPE_X_Eh is None
+    and crossing_frequencies is not None
+):
+    ZPE_X_Eh = (
+        0.5
+        * float(np.sum(crossing_frequencies))
+        / hartree_to_cm
+    )
+    ZPE_X_source = (
+        "0.5*sum(crossing_frequencies)/hartree_to_cm"
+    )
+
+ZPE_corrected_barrier_Eh = None
+
+if (
+    Ele_barrier_Eh is not None
+    and ZPE_R_Eh is not None
+    and ZPE_X_Eh is not None
+):
+    ZPE_corrected_barrier_Eh = (
+        Ele_barrier_Eh
+        + ZPE_X_Eh
+        - ZPE_R_Eh
+    )
+
+export_temperature_min_K = (
+    float(np.asarray(T_grid_K, dtype=float)[0])
+    if "T_grid_K" in globals()
+    else 300.0
+)
+
+export_temperature_max_K = (
+    float(np.asarray(T_grid_K, dtype=float)[-1])
+    if "T_grid_K" in globals()
+    else 350.0
+)
+
+export_energy_step_cm1 = float(
+    globals().get("energy_step_cm1", 1.0)
+)
+
+if "E_max_cm1" not in globals():
+    raise RuntimeError(
+        "Cannot determine the interoperability-export "
+        "maximum bin because E_max_cm1 from Step 7 is missing."
+    )
+
+if export_energy_step_cm1 <= 0.0:
+    raise RuntimeError(
+        "energy_step_cm1 must be greater than zero."
+    )
+
+export_maximum_bin_index = int(
+    np.ceil(
+        float(E_max_cm1)
+        / export_energy_step_cm1
+    )
+)
+
+export_maximum_energy_cm1 = (
+    export_maximum_bin_index
+    * export_energy_step_cm1
+)
+
+# ============================================================
+# 12G. Final report
+# ============================================================
+
+report = []
+
+
+def finite_min_max(values):
+    """
+    Return the minimum and maximum finite values in an array.
+
+    NaN and infinite values are ignored. If no finite values are
+    available, (nan, nan) is returned.
+    """
+    if values is None:
+        return np.nan, np.nan
+
+    arr = np.asarray(values, dtype=float).reshape(-1)
+    finite = arr[np.isfinite(arr)]
+
+    if finite.size == 0:
+        return np.nan, np.nan
+
+    return float(np.min(finite)), float(np.max(finite))
+
+
+# ============================================================
+# Probability and rate extrema
+# These values are written only to FINAL_OUTPUT.txt.
+# Nothing in this section is printed to the console.
+# ============================================================
+
+# Landau-Zener probability
+P_LZ_min, P_LZ_max = finite_min_max(
+    globals().get("effective_LZ_probability", None)
+)
+
+# Raw weak-coupling probability before any Step 11 correction
+P_WC_raw_array = globals().get("P_WC_raw_effective", None)
+
+if P_WC_raw_array is None:
+    # Fallback for workflows where the original Step 8 WC probability
+    # is stored only as effective_WC_probability.
+    P_WC_raw_array = globals().get("effective_WC_probability", None)
+    P_WC_raw_source = "effective_WC_probability"
+else:
+    P_WC_raw_source = "P_WC_raw_effective"
+
+P_WC_raw_min, P_WC_raw_max = finite_min_max(P_WC_raw_array)
+
+# Final weak-coupling probability used downstream
+P_WC_final_min, P_WC_final_max = finite_min_max(active_probWC)
+
+if use_threshold_corrected_WC:
+    P_WC_final_source = (
+        "Threshold-corrected WC probability from Step 11"
+    )
+else:
+    P_WC_final_source = (
+        "Original clipped WC probability; "
+        "no Step 11 correction applied"
+    )
+
+# Microcanonical rates
+k_LZ_micro_min, k_LZ_micro_max = finite_min_max(
+    globals().get("effective_LZ_rate", None)
+)
+
+k_WC_micro_min, k_WC_micro_max = finite_min_max(
+    active_rateWC
+)
+
+# Canonical rates
+k_LZ_canonical_min, k_LZ_canonical_max = finite_min_max(
+    globals().get("k_LZ_canonical_s_inv", None)
+)
+
+k_WC_canonical_min, k_WC_canonical_max = finite_min_max(
+    active_k_WC_canonical
+)
+
+# ============================================================
+# Intermediate SOC values from grouped SOC row norms
+# ============================================================
+
+intermediate_soc_records = []
+
+# Preferred source: intermediate SOC values already constructed in Step 8.
+if (
+    "P_LZ_intermediate" in globals()
+    and isinstance(P_LZ_intermediate, dict)
+    and P_LZ_intermediate
+):
+    for label, data in sorted(
+        P_LZ_intermediate.items(),
+        key=lambda item: float(item[1].get("abs_Ms_low", np.inf))
+    ):
+        intermediate_soc_records.append({
+            "label": str(label),
+            "abs_Ms_low": float(data["abs_Ms_low"]),
+            "degeneracy": int(data.get("degeneracy", 1)),
+            "H_int_cm1": float(data["H_int_cm1"]),
+            "H_rows_cm1": np.asarray(
+                data.get("H_rows_cm1", []),
+                dtype=float
+            ).reshape(-1),
+            "source": "grouped SOC row norms from Step 8",
+        })
+
+# Fallback: reconstruct the intermediate SOCs directly from the
+# Ms-resolved SOC matrix using the same definition employed in Step 8.
+elif (
+    "SOC_Ms_matrix_cm1" in globals()
+    and "Ms_low" in globals()
+):
+    soc_matrix_for_intermediate = np.asarray(
+        SOC_Ms_matrix_cm1,
+        dtype=complex
+    )
+
+    ms_low_for_intermediate = np.asarray(
+        Ms_low,
+        dtype=float
+    ).reshape(-1)
+
+    if soc_matrix_for_intermediate.shape[0] != len(ms_low_for_intermediate):
+        raise RuntimeError(
+            "Cannot construct intermediate SOC values because the number "
+            "of SOC-matrix rows does not match the number of low-spin Ms values."
+        )
+
+    unique_abs_ms = sorted(
+        set(round(abs(float(ms)), 8) for ms in ms_low_for_intermediate)
+    )
+
+    for abs_ms in unique_abs_ms:
+        row_indices = [
+            i
+            for i, ms in enumerate(ms_low_for_intermediate)
+            if abs(abs(float(ms)) - abs_ms) < 1.0e-8
+        ]
+
+        row_soc_values = []
+
+        for i in row_indices:
+            row = soc_matrix_for_intermediate[i, :]
+            row_soc = float(
+                np.sqrt(np.sum(np.abs(row) ** 2))
+            )
+
+            if np.isfinite(row_soc) and row_soc > 1.0e-12:
+                row_soc_values.append(row_soc)
+
+        row_soc_values = np.asarray(
+            row_soc_values,
+            dtype=float
+        )
+
+        if row_soc_values.size == 0:
+            continue
+
+        # Equivalent +Ms and -Ms rows are combined by their RMS,
+        # following the Step 8 intermediate-SOC definition.
+        H_int_cm1 = float(
+            np.sqrt(np.mean(row_soc_values ** 2))
+        )
+
+        intermediate_soc_records.append({
+            "label": f"INT_absMs{abs_ms:g}",
+            "abs_Ms_low": float(abs_ms),
+            "degeneracy": int(len(row_indices)),
+            "H_int_cm1": H_int_cm1,
+            "H_rows_cm1": row_soc_values,
+            "source": "Reconstructed from SOC_Ms_matrix_cm1 in Step 12",
+        })
+# ============================================================
+# Reader-facing SOC formatting for the final report only
+# ============================================================
+
+def _fmt_report_spin_number(value_text, signed=False):
+    """Format a spin value for display without changing internal variables."""
+    value = float(value_text)
+    if abs(value - round(value)) < 1.0e-10:
+        body = str(int(round(value)))
+    else:
+        body = f"{value:g}"
+    if signed and value > 0.0:
+        body = "+" + body
+    return body
+
+
+def format_soc_channel_key_for_report(key):
+    """Convert an internal SOC-channel key to a reader-facing label."""
+    try:
+        left, right = str(key).split("_to_", 1)
+        s_left_text, ms_left_text = left[1:].split("_Ms", 1)
+        s_right_text, ms_right_text = right[1:].split("_Ms", 1)
+
+        s_left = _fmt_report_spin_number(s_left_text)
+        ms_left = _fmt_report_spin_number(ms_left_text, signed=True)
+        s_right = _fmt_report_spin_number(s_right_text)
+        ms_right = _fmt_report_spin_number(ms_right_text, signed=True)
+
+        return (
+            f"(S={s_left},Ms={ms_left}) to "
+            f"(S'={s_right},M's={ms_right})"
+        )
+    except Exception:
+        return str(key)
+
+
+# ============================================================
+# Main final report
+# ============================================================
+
+report.append("FINAL SPINKS OUTPUT")
+report.append("=" * 72)
+report.append(f"jobname = {jobname}")
+report.append(f"final_output_dir = {final_output_dir}")
+report.append("")
+
+report.append("[ALL MS-SPECIFIC SOC CHANNELS]")
+if "H_SO_channels_cm1" in globals() and H_SO_channels_cm1:
+    for key, value in H_SO_channels_cm1.items():
+        channel_label = format_soc_channel_key_for_report(key)
+        report.append(
+            f"{channel_label:45s} = "
+            f"{value.real: .10f} {value.imag:+.10f}i cm^-1 ; "
+            f"H_SO = {abs(value):.10f}"
+        )
+else:
+    report.append("No H_SO_channels_cm1 available.")
+report.append("")
+
+report.append("[CLASSIFIED MS-SPECIFIC SOC MATRIX COMPONENTS]")
+report.append(
+    "These are individual complex SOC matrix elements classified by "
+    "their spin-projection relationships;"
+)
+
+if (
+    "H_SO_intermediate_components_cm1" in globals()
+    and H_SO_intermediate_components_cm1
+):
+    for key, value in H_SO_intermediate_components_cm1.items():
+        report.append(
+            f"{key:20s} = "
+            f"{value.real: .10f} {value.imag:+.10f}i cm^-1 ; "
+            f"H_SO = {abs(value):.10f}"
+        )
+else:
+    report.append("No classified SOC matrix components available.")
+
+report.append("")
+
+
+report.append("[INTERMEDIATE SOC VALUES]")
+
+if intermediate_soc_records:
+    report.append(
+        "Intermediate SOCs are calculated separately for each unique "
+        "|Ms_low| value using grouped SOC row norms."
+    )
+
+    for rec in intermediate_soc_records:
+        rows_text = ", ".join(
+            f"{value:.10f}"
+            for value in rec["H_rows_cm1"]
+        )
+
+        report.append(
+            f"|Ms_low| = {rec['abs_Ms_low']:.6g} ; "
+            f"degeneracy = {rec['degeneracy']} ; "
+            f"H_SO_int = {rec['H_int_cm1']:.10f} cm^-1"
+        )
+
+        if rows_text:
+            report.append(
+                f"  contributing row SOC values = [{rows_text}] cm^-1"
+            )
+
+        report.append(
+            f"  source = {rec['source']}"
+        )
+else:
+    report.append(
+        "No intermediate SOC values are available. "
+        "The workflow may be operating in effective-only SOC mode."
+    )
+
+report.append("")
+
+report.append("[EFFECTIVE SOC]")
+soc_source_display = soc_source
+report.append(
+    f"H_SO_eff = {fmt_scalar(soc_eff)} cm^-1 ; source = {soc_source_display}"
+)
+report.append(
+    "H_SO_ORCA_effective_cm = "
+    f"{fmt_scalar(globals().get('H_SO_ORCA_effective_cm', np.nan))} cm^-1"
+)
+report.append(
+    f"H_SO_source = {globals().get('H_SO_source', 'not available')}"
+)
+report.append("")
+
+report.append("[GRADIENT QUANTITIES]")
+report.append(
+    "the norm of the gradient parallel to the reaction coordinate / GRADIENT_GAP_NORM_EH_PER_BOHR = "
+    f"{fmt_scalar(gradient_gap)} Eh/Bohr ; "
+    f"source = {gradient_gap_source}"
+)
+report.append(
+    "mean gradient / PROJECTED_GRADIENT_MEAN_EH_PER_BOHR = "
+    f"{fmt_scalar(projected_gradient_mean_value)} Eh/Bohr ; "
+    f"source = {projected_gradient_mean_source}"
+)
+report.append("")
+
+report.append("[ROTATIONAL INERTIA / ROTATIONAL DATA]")
+report.append(f"reference inertias source = {reference_inertias_source}")
+report.append(str(reference_inertias))
+report.append(f"crossing inertias source = {crossing_inertias_source}")
+report.append(str(crossing_inertias))
+report.append("")
+
+report.append("[REDUCED MASS]")
+report.append(
+    f"reduced_mass_amu = {fmt_scalar(redmass)} amu ; "
+    f"source = {redmass_source}"
+)
+report.append("")
+
+report.append("[FREQUENCIES]")
+report.append(f"reference frequencies source = {reference_frequencies_source}")
+report.append(f"reference frequency count = "
+    f"{0 if reference_frequencies is None else len(reference_frequencies)}")
+report.append(str(reference_frequencies))
+report.append("")
+
+report.append(f"crossing frequencies source = {crossing_frequencies_source}")
+report.append(f"crossing frequency count = "
+    f"{0 if crossing_frequencies is None else len(crossing_frequencies)}")
+report.append(str(crossing_frequencies))
+report.append("")
+
+report.append("[ENERGIES]")
+report += energy_block(
+    "Electronic_energy_reactant_absolute",
+    Ele_R_abs_Eh
+)
+report += energy_block(
+    "Electronic_energy_MECP_absolute",
+    Ele_X_abs_Eh
+)
+report += energy_block(
+    "Electronic_barrier",
+    Ele_barrier_Eh
+)
+report += energy_block(
+    "ZPE_reactant",
+    ZPE_R_Eh
+)
+report += energy_block(
+    "ZPE_MECP",
+    ZPE_X_Eh
+)
+report += energy_block(
+    "ZPE_corrected_barrier",
+    ZPE_corrected_barrier_Eh
+)
+
+report.append(f"Electronic barrier source = {Ele_barrier_source}")
+report.append(f"ZPE reactant source = {ZPE_R_source}")
+report.append(f"ZPE MECP source = {ZPE_X_source}")
+report.append("")
+
+
+# ============================================================
+# Global probability and rate extrema
+# ============================================================
+
+report.append("[GLOBAL MINIMUM AND MAXIMUM PROBABILITIES AND RATES]")
+report.append("")
+
+report.append("Landau-Zener probability:")
+report.append(f"P_LZ source = effective_LZ_probability")
+report.append(f"Minimum P_LZ = {P_LZ_min:.15e}")
+report.append(f"Maximum P_LZ = {P_LZ_max:.15e}")
+report.append("")
+
+report.append("Raw weak-coupling probability:")
+report.append(f"P_WC_raw source = {P_WC_raw_source}")
+report.append(f"Minimum P_WC_raw = {P_WC_raw_min:.15e}")
+report.append(f"Maximum P_WC_raw = {P_WC_raw_max:.15e}")
+report.append("")
+
+report.append("Final weak-coupling probability used downstream:")
+report.append(f"P_WC_final source = {P_WC_final_source}")
+report.append(f"Minimum P_WC_final = {P_WC_final_min:.15e}")
+report.append(f"Maximum P_WC_final = {P_WC_final_max:.15e}")
+report.append("")
+
+report.append("Microcanonical Landau-Zener rate constants:")
+report.append(f"k_LZ_micro source = effective_LZ_rate")
+report.append(f"Minimum k_LZ_micro = {k_LZ_micro_min:.15e} s^-1")
+report.append(f"Maximum k_LZ_micro = {k_LZ_micro_max:.15e} s^-1")
+report.append("")
+
+report.append("Microcanonical weak-coupling rate constants:")
+report.append(f"k_WC_micro source = {active_WC_label}")
+report.append(f"Minimum k_WC_micro = {k_WC_micro_min:.15e} s^-1")
+report.append(f"Maximum k_WC_micro = {k_WC_micro_max:.15e} s^-1")
+report.append("")
+
+report.append("Canonical Landau-Zener rate constants:")
+report.append(
+    f"k_LZ_canonical source = k_LZ_canonical_s_inv"
+)
+report.append(
+    f"Minimum k_LZ_canonical = {k_LZ_canonical_min:.15e} s^-1"
+)
+report.append(
+    f"Maximum k_LZ_canonical = {k_LZ_canonical_max:.15e} s^-1"
+)
+report.append("")
+
+report.append("Canonical weak-coupling rate constants:")
+report.append(f"k_WC_canonical source = {active_WC_label}")
+report.append(
+    f"Minimum k_WC_canonical = {k_WC_canonical_min:.15e} s^-1"
+)
+report.append(
+    f"Maximum k_WC_canonical = {k_WC_canonical_max:.15e} s^-1"
+)
+report.append("")
+
+
+# ============================================================
+# Existing Step 12 canonical and interactive output
+# ============================================================
+
+report.append("[CANONICAL AND INTERACTIVE STEP 12 OUTPUT]")
+report.extend(step12_console_lines)
+report.append("")
+
+report.append("[SELECTED MICROCANONICAL ENERGY RECORDS]")
+if debug_records:
+    for rec in debug_records:
+        report.append("")
+        for key, value in rec.items():
+            report.append(f"{key} = {value}")
+else:
+    report.append("No interactive energies were selected.")
+report.append("")
+
+
+# ============================================================
+# Write final report
+# ============================================================
+
+final_report_text = "\n".join(report) + "\n"
+
+final_report_file = os.path.join(
+    final_output_dir,
+    "FINAL_OUTPUT.txt"
+)
+
+write_text(
+    final_report_file,
+    final_report_text
+)
+
+# ============================================================
+# 12H. Write optional NAST interoperability input files
+# ============================================================
+
+if reference_frequencies is None:
+    raise RuntimeError(
+        "Cannot write the NAST interoperability input: "
+        "reference frequencies were not found."
+    )
+
+if crossing_frequencies is None:
+    raise RuntimeError(
+        "Cannot write the NAST interoperability input: "
+        "crossing frequencies were not found."
+    )
+
+if reference_inertias is None:
+    raise RuntimeError(
+        "Cannot write the NAST interoperability input: "
+        "reference inertias were not found."
+    )
+
+if crossing_inertias is None:
+    raise RuntimeError(
+        "Cannot write the NAST interoperability input: "
+        "crossing inertias were not found."
+    )
+
+if redmass is None:
+    raise RuntimeError(
+        "Cannot write the NAST interoperability input: "
+        "reduced_mass_amu was not found."
+    )
+
+if soc_eff is None:
+    raise RuntimeError(
+        "Cannot write the NAST interoperability input: "
+        "H_SO_cm was not found."
+    )
+
+if gradient_gap is None:
+    raise RuntimeError(
+        "Cannot write the NAST interoperability input: "
+        "GRADIENT_GAP_NORM_EH_PER_BOHR was not found."
+    )
+
+if projected_gradient_mean_value is None:
+    raise RuntimeError(
+        "Cannot write the NAST interoperability input: "
+        "PROJECTED_GRADIENT_MEAN_EH_PER_BOHR was not found."
+    )
+
+if Ele_barrier_Eh is None:
+    raise RuntimeError(
+        "Cannot write the NAST interoperability input: "
+        "the electronic MECP barrier was not found."
+    )
+
+if ZPE_corrected_barrier_Eh is None:
+    raise RuntimeError(
+        "Cannot write the NAST interoperability input: "
+        "the ZPE-corrected MECP barrier could not be constructed."
+    )
+
+
+def build_nast_interoperability_input(
+    zpe_value,
+    crossing_energy_hartree
+):
+    """
+    Construct a NAST-format namelist for external interoperability.
+
+    The field names inside the returned text are retained because they
+    are required by the external NAST input specification.
+    """
+    return f"""&keys
+zpe = {int(zpe_value)}
+printmore = .true.
+&end
+
+&inputdata
+{format_namelist_array("freR", reference_frequencies)}
+
+{format_namelist_array("freX", crossing_frequencies)}
+
+{format_namelist_array("inertR", reference_inertias)}
+{format_namelist_array("inertX", crossing_inertias)}
+
+enR = 0.0
+enX = {crossing_energy_hartree:.15f}
+
+maxn = {export_maximum_bin_index}
+Estep = {export_energy_step_cm1:.8g}
+T1 = {export_temperature_min_K:.8g}
+T2 = {export_temperature_max_K:.8g}
+&end
+
+&probability
+redmass = {redmass:.15f}
+soc = {soc_eff:.15f}
+grad = {gradient_gap:.15e}
+gradmean = {projected_gradient_mean_value:.15e}
+&end
+"""
+
+
+nast_export_zpe1_text = (
+    build_nast_interoperability_input(
+        zpe_value=1,
+        crossing_energy_hartree=Ele_barrier_Eh
+    )
+)
+
+nast_export_zpe0_text = (
+    build_nast_interoperability_input(
+        zpe_value=0,
+        crossing_energy_hartree=ZPE_corrected_barrier_Eh
+    )
+)
+
+nast_export_zpe1_file = os.path.join(
+    final_output_dir,
+    "NAST_zpe1_electronic_barrier.inp"
+)
+
+nast_export_zpe0_file = os.path.join(
+    final_output_dir,
+    "NAST_zpe0_ZPE_corrected_barrier.inp"
+)
+
+write_text(
+    nast_export_zpe1_file,
+    nast_export_zpe1_text
+)
+
+write_text(
+    nast_export_zpe0_file,
+    nast_export_zpe0_text
+)
+
+remote_final_report_file = final_report_file
+remote_nast_export_zpe1_file = nast_export_zpe1_file
+remote_nast_export_zpe0_file = nast_export_zpe0_file
+
+print(f"Local final report                 : {final_report_file}")
+print(f"Local NAST zpe=1 input             : {nast_export_zpe1_file}")
+print(f"Local NAST zpe=0 input             : {nast_export_zpe0_file}")
+print(
+    f"remote_final_output_dir local alias: "
+    f"{remote_final_output_dir}"
+)
+print(f"Final report alias                 : {remote_final_report_file}")
+print(
+    f"NAST zpe=1 input alias             : "
+    f"{remote_nast_export_zpe1_file}"
+)
+print(
+    f"NAST zpe=0 input alias             : "
+    f"{remote_nast_export_zpe0_file}"
+)
+
+globals().update({
+    "final_output_dir":
+        final_output_dir,
+    "final_report_file":
+        final_report_file,
+    "nast_interoperability_zpe1_file":
+        nast_export_zpe1_file,
+    "nast_interoperability_zpe0_file":
+        nast_export_zpe0_file,
+    "remote_final_output_dir":
+        remote_final_output_dir,
+    "remote_final_report_file":
+        remote_final_report_file,
+    "remote_nast_export_zpe1_file":
+        remote_nast_export_zpe1_file,
+    "remote_nast_export_zpe0_file":
+        remote_nast_export_zpe0_file,
+    "debug_records_step12":
+        debug_records,
+    "ZPE_corrected_barrier_Eh_final":
+        ZPE_corrected_barrier_Eh,
+    "Electronic_barrier_Eh_final":
+        Ele_barrier_Eh,
+    "active_probWC":
+        active_probWC,
+    "active_rateWC":
+        active_rateWC,
+    "active_nosWC":
+        active_nosWC,
+    "active_k_WC_canonical":
+        active_k_WC_canonical,
+    "active_WC_label":
+        active_WC_label,
+    "use_threshold_corrected_WC":
+        use_threshold_corrected_WC,
+})
+
+print("\nSTEP 12 COMPLETED SUCCESSFULLY.\n")
