@@ -59,4 +59,4 @@ If you use SPINKS in your research, please cite our publication:
 
 https://doi.org/10.1021/acs.jctc.6c01615
 
-Citing our work helps support the continued development and improvement of SPINKS.
+Citing our work helps support the continued development and improvement of SPINKS
