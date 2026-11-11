@@ -53,7 +53,7 @@ SSH/SFTP, generates and submits batch jobs, monitors the calculations, and
 retrieves the resulting files.
 
 
-How to Cite SPINKS
+**How to Cite SPINKS**
 
 If you use SPINKS in your research, please cite our publication:
 
