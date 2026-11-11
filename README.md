@@ -51,3 +51,12 @@ generated files in a local project directory.
 This version connects to a remote high-performance computing cluster through
 SSH/SFTP, generates and submits batch jobs, monitors the calculations, and
 retrieves the resulting files.
+
+
+How to Cite SPINKS
+
+If you use SPINKS in your research, please cite our publication:
+
+https://doi.org/10.1021/acs.jctc.6c01615
+
+Citing our work helps support the continued development and improvement of SPINKS.
